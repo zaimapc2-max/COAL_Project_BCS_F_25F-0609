@@ -1,9 +1,5 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 3 reference build
-;  Modules covered: 2 (video, palette, FillRect), 3 (map, tiles),
-;                   4 (sprites: decode, DrawSprite, mirror, clip, blink)
-;  Build:  nasm -f bin mario.asm -o MARIO.COM
-;  Test :  any key = redraw (blink sprite toggles), Esc = exit to DOS
+; Modules covered: 2 (video, palette, FillRect), 3 (map, tiles),4 (sprites), 5 (off-screen frame buffer)
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -21,6 +17,9 @@ MAP_W           equ 60
 MAP_H           equ 12
 MAP_SIZE        equ MAP_W * MAP_H
 
+BUFFER_PARAS    equ 4000                ; 64,000 bytes / 16 = 4000 paragraphs
+BUFFER_WORDS    equ 32000               ; 64,000 bytes / 2 = 32,000 words
+KEEP_PARAS      equ 1000h               ; 64 KB kept for the .COM program
 SPRITE_W        equ 16                  ; every sprite is 16 pixels wide
 SPRITE_H        equ 16                  ; normal height (tall = 2 x this)
 
@@ -66,6 +65,9 @@ SPR_TALL        equ 4           ; flag bit 2: 16x32 instead of 16x16
 draw_seg        dw VIDEO_SEG    ; segment all drawing goes to
 frame_counter   dw 0            ; used by the blink flag
 sprites_ready   db 0            ; 1 after DecodeSprites has run (run only once)
+buffer_seg      dw 0            ; segment of the off-screen frame buffer
+sprite_x        dw -16          ; x of the walking test sprite (signed)
+msg_no_memory   db 'Not enough memory for the frame buffer.', 13, 10, '$'
 
 ; ---------------- palette (R,G,B each 0-63) ----------------
 palette:
@@ -430,25 +432,156 @@ SCENE_COUNT     equ (scene_end - scene_table) / 8   ; 4 words = 8 bytes per row
 ;  CODE
 ; ============================================================================
 main:
+        ; ---- memory: shrink our block, then allocate the frame buffer ----
+        mov  ah, 4Ah                    ; DOS: resize memory block (ES = our PSP)
+        mov  bx, KEEP_PARAS             ; keep 64 KB for code, data and stack
+        int  21h
+        jc   .no_memory
+        mov  ah, 48h                    ; DOS: allocate memory
+        mov  bx, BUFFER_PARAS           ; 4000 paragraphs = 64,000 bytes
+        int  21h
+        jc   .no_memory                 ; carry set = failed
+        mov  [buffer_seg], ax           ; AX = new segment
+        mov  [draw_seg], ax             ; from now on ALL drawing goes here
+
         mov  ax, 0013h                  ; BIOS: set VGA Mode 13h
         int  10h
         call SetPalette                 ; must come AFTER the mode switch
         call DecodeSprites              ; sprite text -> palette numbers
         call ResetMap                   ; working_map = original_map
 .frame:
-        call DrawMap                    ; background first
-        call DrawScene                  ; sprites on top
-        xor  ah, ah                     ; wait for a key
+        call ClearBuffer                ; 1. wipe last frame
+        call DrawMap                    ; 2. background tiles
+        call DrawScene                  ; 3. static test sprites
+        call DrawWalker                 ;    plus the walking sprite
+        call WaitRetrace                ; (test pacing only - timer replaces it on Day 5)
+        call CopyBuffer                 ; 4. ONE copy to the screen per frame
+        mov  ah, 1                      ; key waiting? (does not block)
+        int  16h
+        jz   .no_key                    ; ZF = 1 means no key
+        xor  ah, ah                     ; read it
         int  16h
         cmp  al, 1Bh                    ; Esc?
         je   .quit
-        inc  word [frame_counter]       ; next frame (toggles the blink sprite)
+.no_key:
+        inc  word [frame_counter]
         jmp  .frame
 .quit:
         mov  ax, 0003h                  ; back to text mode (resets palette)
         int  10h
-        mov  ax, 4C00h                  ; DOS exit
+        mov  ax, 4C00h                  ; DOS exit (also frees the buffer)
         int  21h
+.no_memory:
+        mov  dx, msg_no_memory          ; still in text mode: print and leave
+        mov  ah, 9
+        int  21h
+        mov  ax, 4C01h
+        int  21h
+
+; ----------------------------------------------------------------------------
+; ClearBuffer
+; Purpose : fill the whole frame buffer with colour 0 using one block store
+; Inputs  : none        Outputs : none
+; Changes : none (AX, CX, DI, ES preserved)
+; ----------------------------------------------------------------------------
+ClearBuffer:
+        push ax
+        push cx
+        push di
+        push es
+        mov  es, [draw_seg]             ; ES:DI = start of the buffer
+        xor  di, di
+        xor  ax, ax                     ; colour 0 in both bytes of the word
+        mov  cx, BUFFER_WORDS           ; 32,000 words = 64,000 bytes
+        cld
+        rep  stosw                      ; store AX at [ES:DI], DI += 2, CX times
+        pop  es
+        pop  di
+        pop  cx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; CopyBuffer
+; Purpose : copy the finished frame buffer to video memory with one block move
+; Inputs  : none        Outputs : none
+; Changes : none (AX, CX, SI, DI, DS, ES preserved)
+; Note    : DS points at the buffer during the copy, so no variable may be
+;           read between "mov ds" and "rep movsw".
+; ----------------------------------------------------------------------------
+CopyBuffer:
+        push ax
+        push cx
+        push si
+        push di
+        push ds
+        push es
+        mov  ax, VIDEO_SEG
+        mov  es, ax                     ; destination = screen
+        mov  ax, [buffer_seg]           ; read the variable BEFORE changing DS
+        mov  ds, ax                     ; source = frame buffer
+        xor  si, si
+        xor  di, di
+        mov  cx, BUFFER_WORDS
+        cld
+        rep  movsw                      ; [DS:SI] -> [ES:DI], 2 bytes at a time
+        pop  es
+        pop  ds                         ; our variables are reachable again
+        pop  di
+        pop  si
+        pop  cx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; WaitRetrace
+; Purpose : wait for the start of the monitor's vertical retrace (port 3DAh,
+;           bit 3). TEST PACING ONLY: the timer (Day 5) replaces this.
+; Inputs  : none        Outputs : none
+; Changes : none (AX, DX preserved)
+; ----------------------------------------------------------------------------
+WaitRetrace:
+        push ax
+        push dx
+        mov  dx, 3DAh                   ; VGA input status port
+.end_of_old:
+        in   al, dx
+        test al, 8
+        jnz  .end_of_old                ; wait until any retrace in progress ends
+.start_of_new:
+        in   al, dx
+        test al, 8
+        jz   .start_of_new              ; wait until the next one begins
+        pop  dx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawWalker
+; Purpose : draw the test sprite walking right, then move it 2 pixels
+;           (switches between run and stand poses every 8 frames)
+; Inputs  : none        Outputs : none
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawWalker:
+        push ax
+        mov  ax, spr_small_run          ; default pose
+        test word [frame_counter], 8
+        jz   .pose_set
+        mov  ax, spr_small_stand        ; every other 8 frames
+.pose_set:
+        push word [sprite_x]            ; x
+        push word 44                    ; y (a free lane between the rows)
+        push ax                         ; sprite address
+        push word 0                     ; flags: none
+        call DrawSprite
+        add  word [sprite_x], 2         ; move right
+        cmp  word [sprite_x], SCREEN_W  ; signed: past the right edge?
+        jl   .done
+        mov  word [sprite_x], -16       ; wrap: re-enter from the left (clipped)
+.done:
+        pop  ax
+        ret
 
 ; ----------------------------------------------------------------------------
 ; DecodeSprites
