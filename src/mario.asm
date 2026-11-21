@@ -1,10 +1,9 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 2 reference build
-;  Modules covered: 2 (video mode, palette, FillRect) and 3 (map, tiles)
+;  MARIO.ASM  -  Super Mario Engine, DAY 3 reference build
+;  Modules covered: 2 (video, palette, FillRect), 3 (map, tiles),
+;                   4 (sprites: decode, DrawSprite, mirror, clip, blink)
 ;  Build:  nasm -f bin mario.asm -o MARIO.COM
-;  Run  :  inside DOSBox, type MARIO
-;  Test :  1st key = draw level, 2nd key = brick (col 8,row 6) turned to sky,
-;          3rd key = ResetMap restores it, 4th key = exit to DOS.
+;  Test :  any key = redraw (blink sprite toggles), Esc = exit to DOS
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -13,13 +12,17 @@
         jmp  main                       ; data goes after this jump
 
 ; ---------------- constants ----------------
-VIDEO_SEG       equ 0A000h              ; VGA Mode 13h video segment
-SCREEN_W        equ 320                 ; pixels per screen row
-TILE_SIZE       equ 16                  ; tile is 16 x 16 pixels
-SCREEN_COLS     equ 20                  ; tile columns visible on screen
-MAP_W           equ 60                  ; level width in tiles
-MAP_H           equ 12                  ; level height in tiles
-MAP_SIZE        equ MAP_W * MAP_H       ; 720 bytes
+SCREEN_W        equ 320
+SCREEN_H        equ 200
+VIDEO_SEG       equ 0A000h
+TILE_SIZE       equ 16
+SCREEN_COLS     equ 20
+MAP_W           equ 60
+MAP_H           equ 12
+MAP_SIZE        equ MAP_W * MAP_H
+
+SPRITE_W        equ 16                  ; every sprite is 16 pixels wide
+SPRITE_H        equ 16                  ; normal height (tall = 2 x this)
 
 TILE_SKY        equ 0
 TILE_GROUND     equ 1
@@ -36,22 +39,35 @@ TILE_COIN       equ 11
 TILE_FLAG       equ 12
 TILE_COUNT      equ 13
 
-COL_SKY         equ 1
-COL_GROUND      equ 2
-COL_BRICK       equ 3
-COL_PIPE        equ 4
-COL_HERO        equ 5
-COL_ENEMY       equ 6
-COL_TEXT        equ 7
-COL_HUD         equ 8
-COL_OUTLINE     equ 9
-COL_PIPE_LIGHT  equ 10
-COL_COIN        equ 11
-COL_GROUND_TOP  equ 12
-PAL_COUNT       equ 13
+COL_SKY         equ 1           ; strawberry milk pink
+COL_GROUND      equ 2           ; deep matcha
+COL_BRICK       equ 3           ; strawberry pink
+COL_PIPE        equ 4           ; bright matcha
+COL_HERO        equ 5           ; strawberry red
+COL_ENEMY       equ 6           ; chocolate brown
+COL_TEXT        equ 7           ; cream white
+COL_HUD         equ 8           ; dark matcha
+COL_OUTLINE     equ 9           ; dark berry
+COL_PIPE_LIGHT  equ 10          ; matcha highlight
+COL_COIN        equ 11          ; golden yellow
+COL_GROUND_TOP  equ 12          ; light matcha grass
+COL_SKIN        equ 13          ; warm tan
+COL_WHITE       equ 14          ; pure white
+COL_DARKBROWN   equ 15          ; hair and shoes
+COL_TAN         equ 16          ; goomba body
+COL_BLUSH       equ 17          ; cat blush and inner ears
+PAL_COUNT       equ 18          ; number of palette entries
 
-; ---------------- data ----------------
-; palette: R,G,B per entry, each 0-63 (6-bit DAC)
+SPR_MIRROR      equ 1           ; flag bit 0: flip left-right
+SPR_BLINK       equ 2           ; flag bit 1: draw on even frames only
+SPR_TALL        equ 4           ; flag bit 2: 16x32 instead of 16x16
+
+; ---------------- variables ----------------
+draw_seg        dw VIDEO_SEG    ; segment all drawing goes to
+frame_counter   dw 0            ; used by the blink flag
+sprites_ready   db 0            ; 1 after DecodeSprites has run (run only once)
+
+; ---------------- palette (R,G,B each 0-63) ----------------
 palette:
         db  0,  0,  0           ; 0  black (transparent)
         db 63, 53, 56           ; 1  sky
@@ -66,9 +82,13 @@ palette:
         db 50, 58, 40           ; 10 pipe light
         db 63, 50, 15           ; 11 coin
         db 30, 41, 20           ; 12 ground top
+        db 56, 38, 25           ; 13 skin
+        db 63, 63, 63           ; 14 white
+        db 10,  5,  3           ; 15 dark brown
+        db 50, 35, 22           ; 16 tan
+        db 63, 46, 52           ; 17 blush pink
 
-; colour used for each tile code (index = tile code). Placeholder solid colours;
-; real 16x16 bitmaps replace this on Day 3.
+; colour used for each tile code (index = tile code)
 tile_colour:
         db COL_SKY              ; 0  sky
         db COL_GROUND           ; 1  ground
@@ -83,12 +103,6 @@ tile_colour:
         db COL_GROUND_TOP       ; 10 stair block
         db COL_COIN             ; 11 coin
         db COL_TEXT             ; 12 flag pole
-
-; results of the GetTile self-test (look at them in the DOSBox debugger)
-test_brick      dw 0            ; expect 4  (? mushroom block at col 8,row 6)
-test_pipe       dw 0            ; expect 6  (pipe top-left at col 14,row 8)
-test_pit        dw 0            ; expect 0  (pit at col 22,row 10)
-test_outside    dw 0            ; expect 1  (left of the level -> solid)
 
 ; level map, 60 x 12, one row per line. Never changed after assembly.
 original_map:
@@ -106,9 +120,311 @@ original_map:
         db 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1     ; row 11
 
 
-; working copy the game reads and changes. Filled by ResetMap at startup.
 working_map:
         times MAP_SIZE db 0
+
+; ---------------- sprite art ----------------
+; Written as text, 16 characters per row. DecodeSprites turns
+; the characters into palette numbers when the program starts.
+;   .=0 transparent   3=brick pink   4=pipe green  5=hero red
+;   6=enemy brown     7=cream        9=outline     a=10 light green
+;   b=11 gold         d=13 skin      e=14 white    f=15 dark brown
+;   g=16 tan
+;   h=17 blush pink  (cat: e=white fur, f=dark eyes, 5/3=bow)
+sprites_start:
+
+spr_small_stand:
+        db "..99........99.."
+        db ".9he9.5..5.9eh9."
+        db ".9ee95533559ee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeffeeeeffee9."
+        db ".9eeffeeeeffee9."
+        db ".9hheee33eeehh9."
+        db "..9eeeeeeeeee9.."
+        db "...99eeeeee99..."
+        db "..e9444444449e.."
+        db ".9e9444444449e9."
+        db "...9444444449..."
+        db "...9444..4449..."
+        db "...9ee9..9ee9..."
+        db "..9eee9..9eee9.."
+
+spr_small_run:
+        db "..99........99.."
+        db ".9he9.5..5.9eh9."
+        db ".9ee95533559ee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeffeeeeffee9."
+        db ".9eeffeeeeffee9."
+        db ".9hheee33eeehh9."
+        db "..9eeeeeeeeee9.."
+        db "...99eeeeee99..."
+        db ".ee9444444449e.."
+        db "..e9444444449..."
+        db "...9444444449..."
+        db "...944444..449.."
+        db "..9ee9.....9ee9."
+        db ".9eee9......9ee9"
+
+spr_small_jump:
+        db "..99........99.."
+        db ".9he9.5..5.9eh9."
+        db ".9ee95533559ee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeffeeeeffee9."
+        db ".9eeffeeeeffee9."
+        db ".9hheee33eeehh9."
+        db "..9eeeeeeeeee9.."
+        db ".e.99eeeeee99.e."
+        db ".ee9444444449ee."
+        db "..e9444444449e.."
+        db "...9444444449..."
+        db "..9444....4449.."
+        db ".9ee9......9ee9."
+        db ".9eee9....9eee9."
+
+spr_super_stand:
+        db "..99........99.."
+        db ".9he9.5..5.9eh9."
+        db ".9ee95533559ee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeffeeeeffee9."
+        db ".9eeffeeeeffee9."
+        db ".9hheee33eeehh9."
+        db "..9eeeeeeeeee9.."
+        db "...99eeeeee99..."
+        db "..e9444444449e.."
+        db ".ee9444444449ee."
+        db ".e.9444444449.e."
+        db "..e9444444449e.."
+        db "...9444444449..."
+        db "...9444444449..."
+        db "..944444444449.."
+        db "..944444444449.."
+        db ".94444444444449."
+        db ".93333333333339."
+        db "...9ee9..9ee9..."
+        db "...9ee9..9ee9..."
+        db "...9ee9..9ee9..."
+        db "...9ee9..9ee9..."
+        db "...9ee9..9ee9..."
+        db "...9ee9..9ee9..."
+        db "...9ee9..9ee9..."
+        db "...9ee9..9ee9..."
+        db "..9eee9..9eee9.."
+        db "..9eee9..9eee9.."
+        db ".9eeee9..9eeee9."
+        db ".99999....99999."
+
+spr_super_run:
+        db "..99........99.."
+        db ".9he9.5..5.9eh9."
+        db ".9ee95533559ee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeffeeeeffee9."
+        db ".9eeffeeeeffee9."
+        db ".9hheee33eeehh9."
+        db "..9eeeeeeeeee9.."
+        db "...99eeeeee99..."
+        db "..e9444444449e.."
+        db ".ee9444444449e.."
+        db "..e9444444449..."
+        db "...9444444449..."
+        db "...9444444449..."
+        db "...9444444449..."
+        db "..944444444449.."
+        db "..944444444449.."
+        db ".94444444444449."
+        db ".93333333333339."
+        db "..9ee9....9ee9.."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9.......9e9."
+        db ".9ee9.......9e9."
+        db ".9eee9......9e9."
+        db ".9eee9.....9ee9."
+        db ".99999....99ee9."
+        db ".99999....99999."
+
+spr_super_jump:
+        db "..99........99.."
+        db ".9he9.5..5.9eh9."
+        db ".9ee95533559ee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeeeeeeeeeee9."
+        db ".9eeffeeeeffee9."
+        db ".9eeffeeeeffee9."
+        db ".9hheee33eeehh9."
+        db "..9eeeeeeeeee9.."
+        db "...99eeeeee99..."
+        db "e.e9444444449e.e"
+        db ".ee9444444449ee."
+        db "..e9444444449e.."
+        db "...9444444449..."
+        db "...9444444449..."
+        db "...9444444449..."
+        db "..944444444449.."
+        db "..944444444449.."
+        db ".94444444444449."
+        db ".93333333333339."
+        db "..9ee9....9ee9.."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9ee9......9ee9."
+        db ".9eee9....9eee9."
+        db ".9eee9....9eee9."
+        db ".9eeee9..9eeee9."
+        db ".99999....99999."
+
+spr_goomba:
+        db "................"
+        db ".....666666....."
+        db "...6666666666..."
+        db "..666666666666.."
+        db ".66666666666666."
+        db ".6eee666666eee6."
+        db ".6e9e666666e9e6."
+        db ".66666666666666."
+        db "..666666666666.."
+        db "...6666666666..."
+        db "....gggggggg...."
+        db ".....gggggg....."
+        db ".....gggggg....."
+        db "....gggggggg...."
+        db "...fff....fff..."
+        db "..ffff....ffff.."
+
+spr_goomba_flat:
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "...6666666666..."
+        db "..66e66666e666.."
+        db ".66666666666666."
+        db "..gggggggggggg.."
+        db "...fff....fff..."
+        db "..ffff....ffff.."
+
+spr_koopa:
+        db "......dddd......"
+        db ".....dddddd....."
+        db ".....dd9dddd...."
+        db ".....dddddd....."
+        db "......dddd......"
+        db ".....444444....."
+        db "....44aa4444...."
+        db "...4444aa44444.."
+        db "...44a444a4444.."
+        db "...4444444444..."
+        db "...3333333333..."
+        db "....33333333...."
+        db "....dd....dd...."
+        db "....dd....dd...."
+        db "...ffff..ffff..."
+        db "...ffff..ffff..."
+
+spr_shell:
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db "................"
+        db ".....444444....."
+        db "...44aa444444..."
+        db "..44aaaa444444.."
+        db ".4444aa44444444."
+        db ".44444444444444."
+        db ".44444444444444."
+        db "..333333333333.."
+        db "...3333333333..."
+        db "....33333333...."
+
+spr_mushroom:
+        db "................"
+        db ".....333333....."
+        db "...3333333333..."
+        db "..337733337733.."
+        db ".33773333337733."
+        db ".33333777733333."
+        db ".33333333333333."
+        db ".33333333333333."
+        db "..999999999999.."
+        db ".....77777777..."
+        db ".....79777797..."
+        db ".....77777777..."
+        db ".....77777777..."
+        db "......777777...."
+        db "......777777...."
+        db "......999999...."
+
+spr_coin:
+        db "................"
+        db ".....999999....."
+        db "....9bbbbbb9...."
+        db "...9bbbbbbbb9..."
+        db "...9bbb77bbb9..."
+        db "...9bb7bbbbb9..."
+        db "...9bb7bbbbb9..."
+        db "...9bb7bbbbb9..."
+        db "...9bbbbbbbb9..."
+        db "...9bbbbbbbb9..."
+        db "...9bbbbbbbb9..."
+        db "...9bbbbbbbb9..."
+        db "....9bbbbbb9...."
+        db ".....999999....."
+        db "................"
+        db "................"
+
+sprites_end:
+SPRITE_BYTES    equ sprites_end - sprites_start
+
+; ---------------- test scene: x, y, sprite, flags ----------------
+scene_table:
+        dw  16,  20, spr_small_stand, 0
+        dw  40,  20, spr_small_run,   0
+        dw  64,  20, spr_small_jump,  0
+        dw  88,  20, spr_small_run,   SPR_MIRROR
+        dw 128,  20, spr_goomba,      0
+        dw 152,  20, spr_goomba_flat, 0
+        dw 176,  20, spr_koopa,       0
+        dw 200,  20, spr_shell,       0
+        dw 224,  20, spr_mushroom,    0
+        dw 248,  20, spr_coin,        0
+        dw 280,  20, spr_small_stand, SPR_BLINK
+        dw  16,  70, spr_super_stand, SPR_TALL
+        dw  48,  70, spr_super_run,   SPR_TALL
+        dw  80,  70, spr_super_jump,  SPR_TALL
+        dw 112,  70, spr_super_run,   SPR_TALL + SPR_MIRROR
+        dw  -8, 130, spr_small_stand, 0         ; clipped on the left
+        dw 312, 130, spr_small_stand, 0         ; clipped on the right
+        dw 150,  -8, spr_small_stand, 0         ; clipped on the top
+        dw 200, 192, spr_small_stand, 0         ; clipped on the bottom
+        dw 250, 176, spr_super_stand, SPR_TALL  ; tall, clipped bottom
+scene_end:
+SCENE_COUNT     equ (scene_end - scene_table) / 8   ; 4 words = 8 bytes per row
+
 
 ; ============================================================================
 ;  CODE
@@ -117,44 +433,177 @@ main:
         mov  ax, 0013h                  ; BIOS: set VGA Mode 13h
         int  10h
         call SetPalette                 ; must come AFTER the mode switch
+        call DecodeSprites              ; sprite text -> palette numbers
         call ResetMap                   ; working_map = original_map
-        call DrawMap
-
-        ; ---- GetTile self-test (pixel positions -> tile codes) ----
-        push word 8*16                  ; px, pushed first
-        push word 6*16                  ; py, pushed last
-        call GetTile
-        mov  [test_brick], ax
-        push word 14*16
-        push word 8*16
-        call GetTile
-        mov  [test_pipe], ax
-        push word 22*16
-        push word 10*16
-        call GetTile
-        mov  [test_pit], ax
-        push word 0FFFFh                ; -1 = left of the level
-        push word 0
-        call GetTile
-        mov  [test_outside], ax
-
+.frame:
+        call DrawMap                    ; background first
+        call DrawScene                  ; sprites on top
         xor  ah, ah                     ; wait for a key
         int  16h
-
-        mov  byte [working_map + 6*MAP_W + 8], TILE_SKY   ; remove the ? block
-        call DrawMap
-        xor  ah, ah
-        int  16h
-
-        call ResetMap                   ; original copied back
-        call DrawMap
-        xor  ah, ah
-        int  16h
-
+        cmp  al, 1Bh                    ; Esc?
+        je   .quit
+        inc  word [frame_counter]       ; next frame (toggles the blink sprite)
+        jmp  .frame
+.quit:
         mov  ax, 0003h                  ; back to text mode (resets palette)
         int  10h
         mov  ax, 4C00h                  ; DOS exit
         int  21h
+
+; ----------------------------------------------------------------------------
+; DecodeSprites
+; Purpose : turn the sprite text characters into palette numbers, in place.
+;           '.' -> 0, '0'-'9' -> 0-9, 'a'-'h' -> 10-17
+; Inputs  : none
+; Outputs : none (sprites_start..sprites_end now hold numbers)
+; Changes : none (AX, CX, SI preserved). Runs only once (sprites_ready flag).
+; ----------------------------------------------------------------------------
+DecodeSprites:
+        push ax
+        push cx
+        push si
+        cmp  byte [sprites_ready], 0
+        jne  .done                      ; already decoded: do nothing
+        mov  si, sprites_start
+        mov  cx, SPRITE_BYTES
+.next:
+        mov  al, [si]                   ; AL = one text character
+        cmp  al, '.'
+        je   .transparent
+        cmp  al, 'a'
+        jb   .digit                     ; below 'a' -> it is '0'..'9'
+        sub  al, 'a' - 10               ; 'a' -> 10, 'b' -> 11 ...
+        jmp  .store
+.digit:
+        sub  al, '0'                    ; '5' -> 5
+        jmp  .store
+.transparent:
+        xor  al, al                     ; '.' -> 0
+.store:
+        mov  [si], al                   ; overwrite the text with the number
+        inc  si
+        loop .next
+        mov  byte [sprites_ready], 1
+.done:
+        pop  si
+        pop  cx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawSprite(x, y, address, flags)  pushed in that order
+; Purpose : draw a 16-wide sprite at (x,y); colour 0 is transparent.
+;           flags: SPR_MIRROR flip, SPR_BLINK even frames only, SPR_TALL 32 rows
+;           Clips on all four screen edges (off-screen pixels are skipped).
+; Inputs  : [bp+10]=x  [bp+8]=y  [bp+6]=sprite address  [bp+4]=flags
+; Outputs : none
+; Locals  : [bp-2]=current screen y  [bp-4]=rows left  [bp-6]=mirror (0/1)
+; Changes : none (all registers preserved)
+; ----------------------------------------------------------------------------
+DrawSprite:
+        push bp
+        mov  bp, sp
+        sub  sp, 6                      ; room for 3 local words
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        push es
+
+        mov  ax, [bp+4]                 ; AX = flags
+        test ax, SPR_BLINK
+        jz   .blink_ok
+        test word [frame_counter], 1
+        jnz  .exit                      ; odd frame: draw nothing
+.blink_ok:
+        mov  word [bp-6], 0             ; mirror = 0
+        test ax, SPR_MIRROR
+        jz   .mirror_set
+        mov  word [bp-6], 1
+.mirror_set:
+        mov  word [bp-4], SPRITE_H      ; rows = 16
+        test ax, SPR_TALL
+        jz   .height_set
+        mov  word [bp-4], SPRITE_H * 2  ; rows = 32
+.height_set:
+        mov  ax, [bp+8]
+        mov  [bp-2], ax                 ; current screen y = y
+        mov  si, [bp+6]                 ; SI = first pixel of the sprite
+        mov  es, [draw_seg]             ; ES = where we draw
+
+.row_loop:
+        mov  ax, [bp-2]                 ; AX = screen y of this row
+        cmp  ax, SCREEN_H               ; unsigned: also catches negatives
+        jae  .next_row                  ; row off-screen: skip whole row
+        mov  di, ax
+        mov  bx, ax
+        shl  di, 8                      ; y * 256
+        shl  bx, 6                      ; y * 64
+        add  di, bx                     ; DI = y * 320 = start of screen line
+        xor  cx, cx                     ; CX = column 0..15
+.pixel_loop:
+        mov  dx, [bp+10]
+        add  dx, cx                     ; DX = screen x of this pixel
+        cmp  dx, SCREEN_W               ; unsigned: catches left and right
+        jae  .next_pixel                ; off-screen: skip this pixel only
+        mov  bx, cx                     ; BX = column to read
+        cmp  word [bp-6], 0
+        je   .read
+        mov  bx, SPRITE_W - 1
+        sub  bx, cx                     ; mirrored: read from the right end
+.read:
+        mov  al, [si + bx]              ; AL = sprite pixel colour
+        test al, al
+        jz   .next_pixel                ; 0 = transparent: do not draw
+        mov  bx, di
+        add  bx, dx                     ; BX = line start + x
+        mov  [es:bx], al                ; plot the pixel
+.next_pixel:
+        inc  cx
+        cmp  cx, SPRITE_W
+        jb   .pixel_loop
+.next_row:
+        add  si, SPRITE_W               ; ALWAYS move to the next sprite row
+        inc  word [bp-2]                ; next screen line
+        dec  word [bp-4]
+        jnz  .row_loop
+.exit:
+        pop  es
+        pop  di
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        mov  sp, bp                     ; drop the locals
+        pop  bp
+        ret  8
+
+; ----------------------------------------------------------------------------
+; DrawScene
+; Purpose : draw every sprite listed in scene_table (x, y, address, flags)
+; Inputs  : none
+; Outputs : none
+; Changes : none (AX, BX, CX preserved; DrawSprite keeps CX safe)
+; ----------------------------------------------------------------------------
+DrawScene:
+        push bx
+        push cx
+        mov  bx, scene_table            ; BX walks the table
+        mov  cx, SCENE_COUNT            ; how many rows
+.next:
+        push word [bx]                  ; x
+        push word [bx+2]                ; y
+        push word [bx+4]                ; sprite address
+        push word [bx+6]                ; flags
+        call DrawSprite
+        add  bx, 8                      ; next row (4 words)
+        loop .next
+        pop  cx
+        pop  bx
+        ret
 
 ; ----------------------------------------------------------------------------
 ; SetPalette
@@ -198,8 +647,7 @@ FillRect:
         push dx
         push di
         push es
-        mov  ax, VIDEO_SEG
-        mov  es, ax                     ; ES = video memory
+        mov  es, [draw_seg]             ; ES = where we draw (screen or buffer)
         mov  bx, [bp+10]                ; BX = y
         mov  di, bx
         shl  di, 8                      ; y * 256
