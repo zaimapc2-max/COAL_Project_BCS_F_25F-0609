@@ -1,8 +1,8 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 6 reference build
-;  Modules covered: 2 (video, palette, FillRect with clipping), 3 (map, tiles),
-;                   4 (sprites), 5 (frame buffer), 6 (camera and scrolling),
-;                   7 (keyboard interrupt), 8 (timer interrupt and game clock)
+;  MARIO.ASM  -  Super Mario Engine, DAY 7 reference build
+;  Modules covered: 2 (video, palette, FillRect), 3 (map, tiles), 4 (sprites),
+;                   5 (frame buffer), 6 (camera), 7 (keyboard), 8 (timer),
+;                   9 (player movement and physics, 8.8 fixed point)
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -24,6 +24,20 @@ LEVEL_W_PX      equ MAP_W * TILE_SIZE   ; level width in pixels = 960
 CAMERA_FOLLOW   equ 160                 ; camera follows once Mario is past this
 CAMERA_MAX      equ LEVEL_W_PX - SCREEN_W  ; last camera position = 640
 MARIO_START_X   equ 32                  ; world x where every life starts
+
+; ---- physics constants: 8.8 fixed point, 30 frames per second (Appendix A.5)
+ACCEL           equ 0020h               ; 0.125 px/frame^2  direction key held
+BRAKE           equ 0040h               ; 0.25  pressing the opposite direction
+FRICTION        equ 0010h               ; 0.0625 no direction key
+MAX_WALK        equ 0180h               ; 1.5  px/frame
+MAX_RUN         equ 0280h               ; 2.5  px/frame (Shift held)
+GRAVITY         equ 0040h               ; 0.25 added to vertical speed each frame
+JUMP_START      equ 0FA80h              ; -5.5 (two's complement)
+JUMP_CUT        equ 0FE00h              ; -2.0 space released while rising
+MAX_FALL        equ 0400h               ; 4.0
+TEST_FLOOR_Y    equ 144                 ; TEST ONLY: top of Mario standing on row 9
+FORM_SMALL      equ 0
+FORM_SUPER      equ 1
 
 SC_ESC          equ 01h                 ; scan codes (Appendix A.3)
 SC_P            equ 19h
@@ -88,8 +102,20 @@ frame_counter   dw 0            ; used by the blink flag
 sprites_ready   db 0            ; 1 after DecodeSprites has run (run only once)
 buffer_seg      dw 0            ; segment of the off-screen frame buffer
 camera_x       dw 0            ; world x of the left edge of the screen
-mario_x         dw MARIO_START_X ; Mario's WORLD x (whole pixels)
-mario_y         dw 144          ; Mario's y (top of sprite; stands on row 9)
+; ---- hero data (Module 9): position is whole pixels + 8-bit fraction,
+;      velocity is 8.8 fixed point (signed word: high byte = whole pixels)
+mario_x         dw MARIO_START_X ; WORLD x, whole pixels (used for camera/draw)
+mario_xf        db 0            ; fraction of x (0..255 = 0..255/256 pixel)
+mario_y         dw TEST_FLOOR_Y ; y of the top of the sprite, whole pixels
+mario_yf        db 0            ; fraction of y
+mario_vx        dw 0            ; horizontal speed, 8.8 signed
+mario_vy        dw 0            ; vertical speed, 8.8 signed (negative = up)
+on_ground       db 1            ; 1 = standing on something solid
+form            db FORM_SMALL   ; small or super
+hp              db 1            ; health 1 or 2
+invuln_timer    dw 0            ; frames of invulnerability left
+stomp_chain     db 0            ; stomps since last touching the ground
+space_was_down  db 0            ; Space state last frame (new press = new jump)
 key_table       times 128 db 0  ; 1 = key held, 0 = released (index = scan code)
 tick_count      dw 0            ; +1 on every timer tick (changed by the handler)
 last_tick       dw 0            ; tick_count seen by UpdateClock last frame
@@ -474,7 +500,7 @@ main:
         call DecodeSprites
         call ResetMap
         call InstallHandlers            ; keyboard + timer are ours from here on
-        call ResetCamera                ; Mario at the start, camera at 0
+        call ResetHero                  ; Mario at the start, camera at 0
 
 .frame:
         call WaitTick                   ; 1. wait for the next timer tick
@@ -486,11 +512,12 @@ main:
         call DrawWorldItems             ;    objects placed in the level
         call DrawMario
         call DrawMinimap                ;    test aid: where the camera is
+        call DrawPhysicsBars            ;    test aid: on ground + speed
         call CopyBuffer                 ; 10. ONE copy to the screen per frame
         inc  word [frame_counter]
         cmp  byte [key_table + SC_ENTER], 0
         je   .no_restart
-        call ResetCamera                ; Enter: back to the start
+        call ResetHero                  ; Enter: back to the start
 .no_restart:
         cmp  byte [key_table + SC_ESC], 0
         je   .frame
@@ -679,37 +706,145 @@ UpdateClock:
 
 ; ----------------------------------------------------------------------------
 ; UpdateMario
-; Purpose : (test movement, physics comes later) Left/Right move Mario in WORLD
-;           pixels, Left Shift doubles the speed, he faces the last direction,
-;           and he cannot leave either end of the level.
-; Inputs  : none (reads key_table)    Outputs : mario_x, mario_flags
-; Changes : none (AX preserved)
+; Purpose : Section 5.2 physics in 8.8 fixed point, once per frame:
+;           accelerate / brake / friction, walk and run limits, facing,
+;           jump (ground only, new press), variable jump height, gravity,
+;           maximum fall speed, move, level ends.
+;           The floor is a TEST floor for now (Module 10 replaces it).
+; Inputs  : key_table and the hero data     Outputs : the hero data
+; Changes : none (AX, BX, CX, DX preserved)
 ; ----------------------------------------------------------------------------
 UpdateMario:
         push ax
-        mov  ax, 2                      ; walk speed (pixels per frame)
-        cmp  byte [key_table + SC_LSHIFT], 0
-        je   .speed_set
-        mov  ax, 4                      ; run speed
-.speed_set:
+        push bx
+        push cx
+        push dx
+
+        ; ---------- horizontal: which way is the player pushing? ----------
+        xor  bx, bx                     ; BX = direction: -1, 0 or +1
         cmp  byte [key_table + SC_RIGHT], 0
-        je   .not_right
-        add  [mario_x], ax
+        je   .no_right
+        inc  bx
         mov  word [mario_flags], 0      ; face right
-.not_right:
+.no_right:
         cmp  byte [key_table + SC_LEFT], 0
-        je   .not_left
-        sub  [mario_x], ax
+        je   .no_left
+        dec  bx
         mov  word [mario_flags], SPR_MIRROR    ; face left
-.not_left:
-        cmp  word [mario_x], 0          ; SIGNED: went below 0?
+.no_left:
+        mov  cx, MAX_WALK               ; CX = speed limit (positive)
+        cmp  byte [key_table + SC_LSHIFT], 0
+        je   .limit_set
+        mov  cx, MAX_RUN                ; Shift raises the limit
+.limit_set:
+        mov  ax, [mario_vx]             ; AX = horizontal speed (8.8 signed)
+        test bx, bx
+        je   .friction
+        jl   .go_left
+
+        mov  dx, ACCEL                  ; ---- pushing right ----
+        test ax, ax
+        jns  .right_add
+        mov  dx, BRAKE                  ; moving left: brake harder
+.right_add:
+        add  ax, dx
+        cmp  ax, cx                     ; signed compare
+        jle  .speed_done
+        mov  ax, cx                     ; cap at the limit
+        jmp  .speed_done
+
+.go_left:
+        mov  dx, ACCEL                  ; ---- pushing left ----
+        test ax, ax
+        jle  .left_sub
+        mov  dx, BRAKE                  ; moving right: brake harder
+.left_sub:
+        sub  ax, dx
+        neg  cx                         ; CX = -limit
+        cmp  ax, cx
+        jge  .speed_done
+        mov  ax, cx
+        jmp  .speed_done
+
+.friction:                              ; ---- no direction key ----
+        test ax, ax
+        jz   .speed_done
+        js   .friction_neg
+        sub  ax, FRICTION               ; moving right: slow down
+        jns  .speed_done
+        xor  ax, ax                     ; do not slide backwards: stop at 0
+        jmp  .speed_done
+.friction_neg:
+        add  ax, FRICTION               ; moving left: slow down
+        js   .speed_done
+        xor  ax, ax
+.speed_done:
+        mov  [mario_vx], ax
+
+        ; ---------- move horizontally (8.8 speed added to position) ----------
+        mov  dl, al                     ; DL = fraction part of the speed
+        sar  ax, 8                      ; AX = whole part (sign kept)
+        add  [mario_xf], dl             ; fractions first: may set the carry
+        adc  [mario_x], ax              ; whole pixels + carry
+        cmp  word [mario_x], 0          ; SIGNED: past the left end?
         jge  .left_end_ok
-        mov  word [mario_x], 0          ; left end of the level
+        mov  word [mario_x], 0
+        mov  byte [mario_xf], 0
+        mov  word [mario_vx], 0
 .left_end_ok:
         cmp  word [mario_x], LEVEL_W_PX - SPRITE_W
         jle  .right_end_ok
-        mov  word [mario_x], LEVEL_W_PX - SPRITE_W   ; right end of the level
+        mov  word [mario_x], LEVEL_W_PX - SPRITE_W
+        mov  byte [mario_xf], 0
+        mov  word [mario_vx], 0
 .right_end_ok:
+
+        ; ---------- jump ----------
+        cmp  byte [key_table + SC_SPACE], 0
+        je   .space_up
+        cmp  byte [space_was_down], 0
+        jne  .jump_done                 ; Space still held from before: no new jump
+        cmp  byte [on_ground], 0
+        je   .jump_done                 ; in the air: no double jump
+        mov  word [mario_vy], JUMP_START
+        mov  byte [on_ground], 0
+        jmp  .jump_done
+.space_up:                              ; variable jump height
+        cmp  word [mario_vy], JUMP_CUT  ; signed: rising faster than -2.0 ?
+        jge  .jump_done
+        mov  word [mario_vy], JUMP_CUT  ; cut the jump short
+.jump_done:
+        mov  al, [key_table + SC_SPACE]
+        mov  [space_was_down], al       ; remember for next frame
+
+        ; ---------- gravity and vertical move ----------
+        mov  ax, [mario_vy]
+        add  ax, GRAVITY
+        cmp  ax, MAX_FALL
+        jle  .fall_ok
+        mov  ax, MAX_FALL
+.fall_ok:
+        mov  [mario_vy], ax
+        mov  dl, al
+        sar  ax, 8
+        add  [mario_yf], dl
+        adc  [mario_y], ax
+
+        ; ---------- TEST floor (replace with tile collision in Module 10) ----------
+        cmp  word [mario_y], TEST_FLOOR_Y
+        jl   .in_air
+        mov  word [mario_y], TEST_FLOOR_Y
+        mov  byte [mario_yf], 0
+        mov  word [mario_vy], 0
+        mov  byte [on_ground], 1
+        mov  byte [stomp_chain], 0      ; landing resets the stomp chain
+        jmp  .done
+.in_air:
+        mov  byte [on_ground], 0
+.done:
+        pop  dx
+        pop  cx
+        pop  bx
         pop  ax
         ret
 
@@ -745,43 +880,54 @@ UpdateCamera:
         cmp  [mario_x], ax
         jae  .done                      ; Mario is inside the screen
         mov  [mario_x], ax              ; invisible wall on the left
-        ; (when Mario has a speed variable, set it to 0 here as well)
+        mov  byte [mario_xf], 0
+        mov  word [mario_vx], 0         ; and his horizontal speed becomes 0
 .done:
         pop  bx
         pop  ax
         ret
 
 ; ----------------------------------------------------------------------------
-; ResetCamera
-; Purpose : new life or new game: Mario at the start position, camera at 0
-; Inputs  : none        Outputs : camera_x, mario_x, mario_flags
+; ResetHero
+; Purpose : new life or new game: Mario at the start with no speed, standing,
+;           camera at 0
+; Inputs  : none        Outputs : the hero data and camera_x
 ; Changes : none
 ; ----------------------------------------------------------------------------
-ResetCamera:
+ResetHero:
         mov  word [camera_x], 0
         mov  word [mario_x], MARIO_START_X
+        mov  byte [mario_xf], 0
+        mov  word [mario_y], TEST_FLOOR_Y
+        mov  byte [mario_yf], 0
+        mov  word [mario_vx], 0
+        mov  word [mario_vy], 0
+        mov  byte [on_ground], 1
+        mov  byte [stomp_chain], 0
         mov  word [mario_flags], 0
+        mov  byte [space_was_down], 0
         ret
 
 ; ----------------------------------------------------------------------------
 ; DrawMario
-; Purpose : draw Mario at screen_x = world_x - camera_x. Running pose
-;           (alternating every 8 frames) while a direction key is held.
+; Purpose : draw Mario at screen_x = world_x - camera_x with the right pose:
+;           jumping sprite in the air, running sprite (alternating every 8
+;           frames) while he moves on the ground, standing sprite otherwise
 ; Inputs  : none        Outputs : none
 ; Changes : none (AX, BX preserved)
 ; ----------------------------------------------------------------------------
 DrawMario:
         push ax
         push bx
-        mov  ax, spr_small_stand        ; default: standing
-        cmp  byte [key_table + SC_LEFT], 0
-        jne  .moving
-        cmp  byte [key_table + SC_RIGHT], 0
-        je   .pose_set
-.moving:
+        mov  ax, spr_small_jump
+        cmp  byte [on_ground], 0
+        je   .pose_set                  ; in the air
+        mov  ax, spr_small_stand
+        cmp  word [mario_vx], 0
+        je   .pose_set                  ; standing still
         test word [frame_counter], 8
         jz   .pose_set
-        mov  ax, spr_small_run
+        mov  ax, spr_small_run          ; swap pose every 8 frames
 .pose_set:
         mov  bx, [mario_x]
         sub  bx, [camera_x]             ; world x -> screen x
@@ -827,6 +973,41 @@ DrawMinimap:
         push word 8
         push word COL_HERO
         call FillRect
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawPhysicsBars
+; Purpose : (test aid) a lamp that is lit while Mario is on the ground, and a
+;           bar whose length is his horizontal speed (|vx| / 8 pixels)
+; Inputs  : none        Outputs : none
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawPhysicsBars:
+        push ax
+        mov  ax, COL_OUTLINE            ; dark = in the air
+        cmp  byte [on_ground], 0
+        je   .lamp
+        mov  ax, COL_GROUND_TOP         ; green = on the ground
+.lamp:
+        push word 8
+        push word 2
+        push word 12
+        push word 12
+        push ax
+        call FillRect
+        mov  ax, [mario_vx]
+        test ax, ax
+        jns  .positive
+        neg  ax                         ; |vx|
+.positive:
+        shr  ax, 3                      ; 2.5 px/frame (0280h) -> 80 pixels
+        push word 40
+        push word 11
+        push ax
+        push word 4
+        push word COL_COIN
+        call FillRect                   ; width 0 draws nothing
         pop  ax
         ret
 
