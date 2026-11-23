@@ -1,5 +1,8 @@
 ; ============================================================================
-; Modules covered: 2 (video, palette, FillRect), 3 (map, tiles),4 (sprites), 5 (off-screen frame buffer)
+;  MARIO.ASM  -  Super Mario Engine, DAY 5 reference build
+;  Modules covered: 2 (video, palette, FillRect), 3 (map, tiles),
+;                   4 (sprites), 5 (frame buffer),
+;  
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -16,6 +19,19 @@ SCREEN_COLS     equ 20
 MAP_W           equ 60
 MAP_H           equ 12
 MAP_SIZE        equ MAP_W * MAP_H
+
+SC_ESC          equ 01h                 ; scan codes (Appendix A.3)
+SC_P            equ 19h
+SC_ENTER        equ 1Ch
+SC_LSHIFT       equ 2Ah
+SC_SPACE        equ 39h
+SC_UP           equ 48h
+SC_LEFT         equ 4Bh
+SC_RIGHT        equ 4Dh
+SC_DOWN         equ 50h
+
+PIT_DIVISOR     equ 39773               ; 1,193,182 Hz / 39,773 = 30 ticks/second
+TICKS_PER_SEC   equ 30
 
 BUFFER_PARAS    equ 4000                ; 64,000 bytes / 16 = 4000 paragraphs
 BUFFER_WORDS    equ 32000               ; 64,000 bytes / 2 = 32,000 words
@@ -67,6 +83,19 @@ frame_counter   dw 0            ; used by the blink flag
 sprites_ready   db 0            ; 1 after DecodeSprites has run (run only once)
 buffer_seg      dw 0            ; segment of the off-screen frame buffer
 sprite_x        dw -16          ; x of the walking test sprite (signed)
+key_table       times 128 db 0  ; 1 = key held, 0 = released (index = scan code)
+tick_count      dw 0            ; +1 on every timer tick (changed by the handler)
+last_tick       dw 0            ; tick_count seen by UpdateClock last frame
+chain_acc       dw 0            ; accumulator: decides when to call the old timer
+sec_acc         dw 0            ; ticks collected towards the next second
+game_seconds    dw 0            ; real seconds elapsed (test bar; HUD clock later)
+old_int8_off    dw 0            ; original timer vector  (offset first,
+old_int8_seg    dw 0            ;                         then segment: JMP FAR)
+old_int9_off    dw 0            ; original keyboard vector
+old_int9_seg    dw 0
+handlers_installed db 0         ; 1 once our handlers are in place
+walker_flags    dw 0            ; SPR_MIRROR when facing left
+lamp_keys       db SC_RIGHT, SC_LSHIFT, SC_SPACE   ; keys shown by the lamps
 msg_no_memory   db 'Not enough memory for the frame buffer.', 13, 10, '$'
 
 ; ---------------- palette (R,G,B each 0-63) ----------------
@@ -441,42 +470,333 @@ main:
         mov  bx, BUFFER_PARAS           ; 4000 paragraphs = 64,000 bytes
         int  21h
         jc   .no_memory                 ; carry set = failed
-        mov  [buffer_seg], ax           ; AX = new segment
-        mov  [draw_seg], ax             ; from now on ALL drawing goes here
+        mov  [buffer_seg], ax
+        mov  [draw_seg], ax             ; all drawing goes to the buffer
 
         mov  ax, 0013h                  ; BIOS: set VGA Mode 13h
         int  10h
-        call SetPalette                 ; must come AFTER the mode switch
-        call DecodeSprites              ; sprite text -> palette numbers
-        call ResetMap                   ; working_map = original_map
+        call SetPalette
+        call DecodeSprites
+        call ResetMap
+        call InstallHandlers            ; keyboard + timer are ours from here on
+
 .frame:
-        call ClearBuffer                ; 1. wipe last frame
-        call DrawMap                    ; 2. background tiles
-        call DrawScene                  ; 3. static test sprites
-        call DrawWalker                 ;    plus the walking sprite
-        call WaitRetrace                ; (test pacing only - timer replaces it on Day 5)
-        call CopyBuffer                 ; 4. ONE copy to the screen per frame
-        mov  ah, 1                      ; key waiting? (does not block)
-        int  16h
-        jz   .no_key                    ; ZF = 1 means no key
-        xor  ah, ah                     ; read it
-        int  16h
-        cmp  al, 1Bh                    ; Esc?
-        je   .quit
-.no_key:
+        call WaitTick                   ; 1. wait for the next timer tick
+        call UpdateClock                ; 6. count real seconds
+        call UpdateWalker               ; 2-3. read the key table, move
+        call ClearBuffer                ; 9. wipe last frame
+        call DrawMap
+        call DrawScene
+        call DrawWalker
+        call DrawTestWidgets            ;    key lamps + seconds bar
+        call CopyBuffer                 ; 10. ONE copy to the screen per frame
         inc  word [frame_counter]
-        jmp  .frame
-.quit:
-        mov  ax, 0003h                  ; back to text mode (resets palette)
-        int  10h
-        mov  ax, 4C00h                  ; DOS exit (also frees the buffer)
-        int  21h
-.no_memory:
+        cmp  byte [key_table + SC_ESC], 0
+        je   .frame
+        jmp  Shutdown                   ; the ONLY way out of the game
+
+.no_memory:                             ; handlers are not installed yet
         mov  dx, msg_no_memory          ; still in text mode: print and leave
         mov  ah, 9
         int  21h
         mov  ax, 4C01h
         int  21h
+
+; ----------------------------------------------------------------------------
+; KeyboardHandler  (hardware interrupt INT 09h)
+; Purpose : record every key press/release in key_table (1 = held, 0 = not).
+;           Ignores the 0E0h prefix that arrow keys send.
+; Inputs  : scan code from port 60h
+; Outputs : key_table updated
+; Changes : none (AX, BX preserved; ends with IRET)
+; Note    : DS is unknown inside an interrupt, so variables use the CS: prefix.
+; ----------------------------------------------------------------------------
+KeyboardHandler:
+        push ax
+        push bx
+        in   al, 60h                    ; AL = scan code
+        cmp  al, 0E0h
+        je   .done                      ; extended-key prefix: ignore it
+        mov  bl, al
+        and  bl, 7Fh                    ; BL = key number (bit 7 removed)
+        xor  bh, bh                     ; BX = table index
+        test al, 80h                    ; bit 7 set = key released
+        jnz  .released
+        mov  byte [cs:key_table + bx], 1
+        jmp  .done
+.released:
+        mov  byte [cs:key_table + bx], 0
+.done:
+        mov  al, 20h
+        out  20h, al                    ; EOI: tell the PIC we are finished
+        pop  bx
+        pop  ax
+        iret
+
+; ----------------------------------------------------------------------------
+; TimerHandler  (hardware interrupt INT 08h, now 30 ticks per second)
+; Purpose : count ticks, and call the ORIGINAL timer handler 18.2 times per
+;           second so the DOS clock keeps its normal pace.
+; Inputs  : none
+; Outputs : tick_count + 1
+; Changes : none (AX preserved)
+; Note    : when chaining, the old handler sends the EOI and does the IRET.
+; ----------------------------------------------------------------------------
+TimerHandler:
+        push ax
+        inc  word [cs:tick_count]
+        mov  ax, PIT_DIVISOR
+        add  [cs:chain_acc], ax         ; carry out about 18.2 times a second
+        jc   .chain
+        mov  al, 20h
+        out  20h, al                    ; no chaining this tick: we send the EOI
+        pop  ax
+        iret
+.chain:
+        pop  ax
+        jmp  far [cs:old_int8_off]      ; old handler finishes with EOI + IRET
+
+; ----------------------------------------------------------------------------
+; InstallHandlers
+; Purpose : save the old INT 08h/09h vectors, install ours, speed the timer
+;           up to 30 ticks per second.
+; Inputs  : none        Outputs : none
+; Changes : none (AX, BX, DX, ES preserved)
+; ----------------------------------------------------------------------------
+InstallHandlers:
+        push ax
+        push bx
+        push dx
+        push es
+        mov  ax, 3509h                  ; DOS: get vector 09h -> ES:BX
+        int  21h
+        mov  [old_int9_off], bx
+        mov  [old_int9_seg], es
+        mov  ax, 3508h                  ; DOS: get vector 08h -> ES:BX
+        int  21h
+        mov  [old_int8_off], bx
+        mov  [old_int8_seg], es
+        cli                             ; no interrupts while we switch over
+        mov  dx, KeyboardHandler        ; DS:DX = new handler (DS = CS in a .COM)
+        mov  ax, 2509h                  ; DOS: set vector 09h
+        int  21h
+        mov  dx, TimerHandler
+        mov  ax, 2508h                  ; DOS: set vector 08h
+        int  21h
+        mov  al, 36h                    ; PIT channel 0, lo/hi byte, square wave
+        out  43h, al
+        mov  ax, PIT_DIVISOR
+        out  40h, al                    ; low byte of the divisor
+        mov  al, ah
+        out  40h, al                    ; high byte
+        mov  byte [handlers_installed], 1
+        sti
+        pop  es
+        pop  dx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; Shutdown   (never returns - every exit from the game jumps here)
+; Purpose : put the timer rate and both vectors back, return to text mode,
+;           exit to DOS.
+; Inputs  : none        Outputs : none
+; ----------------------------------------------------------------------------
+Shutdown:
+        cmp  byte [handlers_installed], 0
+        je   .text_mode                 ; nothing to undo
+        cli
+        mov  al, 36h
+        out  43h, al
+        xor  ax, ax                     ; divisor 0 = 65,536 = the 18.2 Hz default
+        out  40h, al
+        out  40h, al
+        push ds
+        mov  dx, [old_int8_off]         ; read both BEFORE changing DS
+        mov  ax, [old_int8_seg]
+        mov  ds, ax
+        mov  ax, 2508h                  ; DOS: set vector 08h = original timer
+        int  21h
+        pop  ds
+        push ds
+        mov  dx, [old_int9_off]
+        mov  ax, [old_int9_seg]
+        mov  ds, ax
+        mov  ax, 2509h                  ; DOS: set vector 09h = original keyboard
+        int  21h
+        pop  ds
+        mov  byte [handlers_installed], 0
+        sti
+.text_mode:
+        mov  ax, 0003h                  ; text mode (also resets the palette)
+        int  10h
+        mov  ax, 4C00h                  ; DOS exit (also frees the buffer)
+        int  21h
+
+; ----------------------------------------------------------------------------
+; WaitTick
+; Purpose : wait until the timer handler has counted one more tick
+;           (replaces any delay loop: speed is the same on every PC)
+; Inputs  : none        Outputs : none
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+WaitTick:
+        push ax
+        mov  ax, [tick_count]           ; tick number when we arrived
+.wait:
+        cmp  ax, [tick_count]           ; re-read memory: the interrupt changes it
+        je   .wait
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; UpdateClock
+; Purpose : turn elapsed ticks into real seconds (30 ticks = 1 second).
+;           Counts the ticks that really passed, so a slow frame loses nothing.
+; Inputs  : none        Outputs : game_seconds
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+UpdateClock:
+        push ax
+        push bx
+        mov  ax, [tick_count]
+        mov  bx, ax                     ; keep this reading
+        sub  ax, [last_tick]            ; ticks since last frame (wrap-safe)
+        mov  [last_tick], bx
+        add  [sec_acc], ax              ; collect them
+.more:
+        cmp  word [sec_acc], TICKS_PER_SEC
+        jb   .done
+        sub  word [sec_acc], TICKS_PER_SEC
+        inc  word [game_seconds]        ; one real second has passed
+        jmp  .more
+.done:
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; UpdateWalker
+; Purpose : move the test sprite from the key table:
+;           Left/Right move it, Left Shift doubles the speed, and the sprite
+;           faces the last direction pressed. Clamped to the screen.
+; Inputs  : none (reads key_table)    Outputs : sprite_x, walker_flags
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+UpdateWalker:
+        push ax
+        mov  ax, 2                      ; walk speed (pixels per frame)
+        cmp  byte [key_table + SC_LSHIFT], 0
+        je   .speed_set
+        mov  ax, 4                      ; run speed
+.speed_set:
+        cmp  byte [key_table + SC_RIGHT], 0
+        je   .not_right
+        add  [sprite_x], ax
+        mov  word [walker_flags], 0     ; face right
+.not_right:
+        cmp  byte [key_table + SC_LEFT], 0
+        je   .not_left
+        sub  [sprite_x], ax
+        mov  word [walker_flags], SPR_MIRROR   ; face left
+.not_left:
+        cmp  word [sprite_x], 0         ; signed clamp: stay on the screen
+        jge  .left_ok
+        mov  word [sprite_x], 0
+.left_ok:
+        cmp  word [sprite_x], SCREEN_W - SPRITE_W
+        jle  .right_ok
+        mov  word [sprite_x], SCREEN_W - SPRITE_W
+.right_ok:
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawWalker
+; Purpose : draw the test sprite; running pose (alternating every 8 frames)
+;           while a direction key is held, standing pose otherwise
+; Inputs  : none        Outputs : none
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawWalker:
+        push ax
+        mov  ax, spr_small_stand        ; default: standing
+        cmp  byte [key_table + SC_LEFT], 0
+        jne  .moving
+        cmp  byte [key_table + SC_RIGHT], 0
+        je   .pose_set
+.moving:
+        test word [frame_counter], 8
+        jz   .pose_set
+        mov  ax, spr_small_run          ; swap pose every 8 frames
+.pose_set:
+        push word [sprite_x]            ; x
+        push word 44                    ; y (a free lane between the rows)
+        push ax                         ; sprite address
+        push word [walker_flags]        ; mirror when facing left
+        call DrawSprite
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawTestWidgets
+; Purpose : (test aid) three lamps for Right / Left Shift / Space, lit while
+;           held, and a bar that grows by one block per real second (max 30)
+; Inputs  : none        Outputs : none
+; Changes : none (AX, BX, CX, SI preserved)
+; ----------------------------------------------------------------------------
+DrawTestWidgets:
+        push ax
+        push bx
+        push cx
+        push si
+        xor  bx, bx                     ; BX = lamp number 0..2
+.lamp:
+        mov  al, [lamp_keys + bx]       ; scan code this lamp watches
+        xor  ah, ah
+        mov  si, ax
+        mov  ax, COL_OUTLINE            ; dark = not held
+        cmp  byte [key_table + si], 0
+        je   .draw_lamp
+        mov  ax, COL_COIN               ; gold = held
+.draw_lamp:
+        mov  cx, bx
+        shl  cx, 4                      ; lamp number * 16
+        add  cx, 8                      ; x = 8, 24, 40
+        push cx
+        push word 2                     ; y
+        push word 12                    ; w
+        push word 12                    ; h
+        push ax                         ; colour
+        call FillRect
+        inc  bx
+        cmp  bx, 3
+        jb   .lamp
+
+        mov  cx, [game_seconds]         ; seconds bar
+        cmp  cx, 30
+        jbe  .bar_size_ok
+        mov  cx, 30                     ; cap at 30 blocks
+.bar_size_ok:
+        test cx, cx
+        jz   .done
+        mov  bx, 64                     ; x of the first block
+.bar:
+        push bx
+        push word 2
+        push word 6
+        push word 12
+        push word COL_GROUND_TOP
+        call FillRect
+        add  bx, 8
+        loop .bar                       ; FillRect keeps CX safe
+.done:
+        pop  si
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
 
 ; ----------------------------------------------------------------------------
 ; ClearBuffer
@@ -494,7 +814,7 @@ ClearBuffer:
         xor  ax, ax                     ; colour 0 in both bytes of the word
         mov  cx, BUFFER_WORDS           ; 32,000 words = 64,000 bytes
         cld
-        rep  stosw                      ; store AX at [ES:DI], DI += 2, CX times
+        rep  stosw
         pop  es
         pop  di
         pop  cx
@@ -524,62 +844,12 @@ CopyBuffer:
         xor  di, di
         mov  cx, BUFFER_WORDS
         cld
-        rep  movsw                      ; [DS:SI] -> [ES:DI], 2 bytes at a time
+        rep  movsw
         pop  es
         pop  ds                         ; our variables are reachable again
         pop  di
         pop  si
         pop  cx
-        pop  ax
-        ret
-
-; ----------------------------------------------------------------------------
-; WaitRetrace
-; Purpose : wait for the start of the monitor's vertical retrace (port 3DAh,
-;           bit 3). TEST PACING ONLY: the timer (Day 5) replaces this.
-; Inputs  : none        Outputs : none
-; Changes : none (AX, DX preserved)
-; ----------------------------------------------------------------------------
-WaitRetrace:
-        push ax
-        push dx
-        mov  dx, 3DAh                   ; VGA input status port
-.end_of_old:
-        in   al, dx
-        test al, 8
-        jnz  .end_of_old                ; wait until any retrace in progress ends
-.start_of_new:
-        in   al, dx
-        test al, 8
-        jz   .start_of_new              ; wait until the next one begins
-        pop  dx
-        pop  ax
-        ret
-
-; ----------------------------------------------------------------------------
-; DrawWalker
-; Purpose : draw the test sprite walking right, then move it 2 pixels
-;           (switches between run and stand poses every 8 frames)
-; Inputs  : none        Outputs : none
-; Changes : none (AX preserved)
-; ----------------------------------------------------------------------------
-DrawWalker:
-        push ax
-        mov  ax, spr_small_run          ; default pose
-        test word [frame_counter], 8
-        jz   .pose_set
-        mov  ax, spr_small_stand        ; every other 8 frames
-.pose_set:
-        push word [sprite_x]            ; x
-        push word 44                    ; y (a free lane between the rows)
-        push ax                         ; sprite address
-        push word 0                     ; flags: none
-        call DrawSprite
-        add  word [sprite_x], 2         ; move right
-        cmp  word [sprite_x], SCREEN_W  ; signed: past the right edge?
-        jl   .done
-        mov  word [sprite_x], -16       ; wrap: re-enter from the left (clipped)
-.done:
         pop  ax
         ret
 
