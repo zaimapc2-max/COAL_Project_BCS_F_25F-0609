@@ -1,8 +1,8 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 5 reference build
-;  Modules covered: 2 (video, palette, FillRect), 3 (map, tiles),
-;                   4 (sprites), 5 (frame buffer),
-;  
+;  MARIO.ASM  -  Super Mario Engine, DAY 6 reference build
+;  Modules covered: 2 (video, palette, FillRect with clipping), 3 (map, tiles),
+;                   4 (sprites), 5 (frame buffer), 6 (camera and scrolling),
+;                   7 (keyboard interrupt), 8 (timer interrupt and game clock)
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -19,6 +19,11 @@ SCREEN_COLS     equ 20
 MAP_W           equ 60
 MAP_H           equ 12
 MAP_SIZE        equ MAP_W * MAP_H
+
+LEVEL_W_PX      equ MAP_W * TILE_SIZE   ; level width in pixels = 960
+CAMERA_FOLLOW   equ 160                 ; camera follows once Mario is past this
+CAMERA_MAX      equ LEVEL_W_PX - SCREEN_W  ; last camera position = 640
+MARIO_START_X   equ 32                  ; world x where every life starts
 
 SC_ESC          equ 01h                 ; scan codes (Appendix A.3)
 SC_P            equ 19h
@@ -82,7 +87,9 @@ draw_seg        dw VIDEO_SEG    ; segment all drawing goes to
 frame_counter   dw 0            ; used by the blink flag
 sprites_ready   db 0            ; 1 after DecodeSprites has run (run only once)
 buffer_seg      dw 0            ; segment of the off-screen frame buffer
-sprite_x        dw -16          ; x of the walking test sprite (signed)
+camera_x       dw 0            ; world x of the left edge of the screen
+mario_x         dw MARIO_START_X ; Mario's WORLD x (whole pixels)
+mario_y         dw 144          ; Mario's y (top of sprite; stands on row 9)
 key_table       times 128 db 0  ; 1 = key held, 0 = released (index = scan code)
 tick_count      dw 0            ; +1 on every timer tick (changed by the handler)
 last_tick       dw 0            ; tick_count seen by UpdateClock last frame
@@ -94,8 +101,7 @@ old_int8_seg    dw 0            ;                         then segment: JMP FAR)
 old_int9_off    dw 0            ; original keyboard vector
 old_int9_seg    dw 0
 handlers_installed db 0         ; 1 once our handlers are in place
-walker_flags    dw 0            ; SPR_MIRROR when facing left
-lamp_keys       db SC_RIGHT, SC_LSHIFT, SC_SPACE   ; keys shown by the lamps
+mario_flags     dw 0            ; SPR_MIRROR when facing left
 msg_no_memory   db 'Not enough memory for the frame buffer.', 13, 10, '$'
 
 ; ---------------- palette (R,G,B each 0-63) ----------------
@@ -431,30 +437,19 @@ spr_coin:
 sprites_end:
 SPRITE_BYTES    equ sprites_end - sprites_start
 
-; ---------------- test scene: x, y, sprite, flags ----------------
-scene_table:
-        dw  16,  20, spr_small_stand, 0
-        dw  40,  20, spr_small_run,   0
-        dw  64,  20, spr_small_jump,  0
-        dw  88,  20, spr_small_run,   SPR_MIRROR
-        dw 128,  20, spr_goomba,      0
-        dw 152,  20, spr_goomba_flat, 0
-        dw 176,  20, spr_koopa,       0
-        dw 200,  20, spr_shell,       0
-        dw 224,  20, spr_mushroom,    0
-        dw 248,  20, spr_coin,        0
-        dw 280,  20, spr_small_stand, SPR_BLINK
-        dw  16,  70, spr_super_stand, SPR_TALL
-        dw  48,  70, spr_super_run,   SPR_TALL
-        dw  80,  70, spr_super_jump,  SPR_TALL
-        dw 112,  70, spr_super_run,   SPR_TALL + SPR_MIRROR
-        dw  -8, 130, spr_small_stand, 0         ; clipped on the left
-        dw 312, 130, spr_small_stand, 0         ; clipped on the right
-        dw 150,  -8, spr_small_stand, 0         ; clipped on the top
-        dw 200, 192, spr_small_stand, 0         ; clipped on the bottom
-        dw 250, 176, spr_super_stand, SPR_TALL  ; tall, clipped bottom
-scene_end:
-SCENE_COUNT     equ (scene_end - scene_table) / 8   ; 4 words = 8 bytes per row
+; ---------------- world objects: WORLD x, y, sprite, flags ----------------
+; Their positions are in the level, not on the screen. DrawWorldItems converts
+; each one with  screen_x = world_x - camera_x  and skips those off screen.
+world_items:
+        dw 200,  96, spr_coin,     0
+        dw 300, 144, spr_goomba,   0
+        dw 344,  96, spr_coin,     0
+        dw 420, 144, spr_koopa,    0
+        dw 600, 144, spr_mushroom, 0
+        dw 700, 144, spr_goomba,   0
+        dw 840, 112, spr_coin,     0
+world_items_end:
+ITEM_COUNT      equ (world_items_end - world_items) / 8   ; 4 words = 8 bytes
 
 
 ; ============================================================================
@@ -479,18 +474,24 @@ main:
         call DecodeSprites
         call ResetMap
         call InstallHandlers            ; keyboard + timer are ours from here on
+        call ResetCamera                ; Mario at the start, camera at 0
 
 .frame:
         call WaitTick                   ; 1. wait for the next timer tick
         call UpdateClock                ; 6. count real seconds
-        call UpdateWalker               ; 2-3. read the key table, move
+        call UpdateMario                ; 2-3. read the key table, move Mario
+        call UpdateCamera               ; 8. follow Mario (Section 5.3)
         call ClearBuffer                ; 9. wipe last frame
-        call DrawMap
-        call DrawScene
-        call DrawWalker
-        call DrawTestWidgets            ;    key lamps + seconds bar
+        call DrawMap                    ;    tiles, shifted by the camera
+        call DrawWorldItems             ;    objects placed in the level
+        call DrawMario
+        call DrawMinimap                ;    test aid: where the camera is
         call CopyBuffer                 ; 10. ONE copy to the screen per frame
         inc  word [frame_counter]
+        cmp  byte [key_table + SC_ENTER], 0
+        je   .no_restart
+        call ResetCamera                ; Enter: back to the start
+.no_restart:
         cmp  byte [key_table + SC_ESC], 0
         je   .frame
         jmp  Shutdown                   ; the ONLY way out of the game
@@ -677,14 +678,14 @@ UpdateClock:
         ret
 
 ; ----------------------------------------------------------------------------
-; UpdateWalker
-; Purpose : move the test sprite from the key table:
-;           Left/Right move it, Left Shift doubles the speed, and the sprite
-;           faces the last direction pressed. Clamped to the screen.
-; Inputs  : none (reads key_table)    Outputs : sprite_x, walker_flags
+; UpdateMario
+; Purpose : (test movement, physics comes later) Left/Right move Mario in WORLD
+;           pixels, Left Shift doubles the speed, he faces the last direction,
+;           and he cannot leave either end of the level.
+; Inputs  : none (reads key_table)    Outputs : mario_x, mario_flags
 ; Changes : none (AX preserved)
 ; ----------------------------------------------------------------------------
-UpdateWalker:
+UpdateMario:
         push ax
         mov  ax, 2                      ; walk speed (pixels per frame)
         cmp  byte [key_table + SC_LSHIFT], 0
@@ -693,34 +694,85 @@ UpdateWalker:
 .speed_set:
         cmp  byte [key_table + SC_RIGHT], 0
         je   .not_right
-        add  [sprite_x], ax
-        mov  word [walker_flags], 0     ; face right
+        add  [mario_x], ax
+        mov  word [mario_flags], 0      ; face right
 .not_right:
         cmp  byte [key_table + SC_LEFT], 0
         je   .not_left
-        sub  [sprite_x], ax
-        mov  word [walker_flags], SPR_MIRROR   ; face left
+        sub  [mario_x], ax
+        mov  word [mario_flags], SPR_MIRROR    ; face left
 .not_left:
-        cmp  word [sprite_x], 0         ; signed clamp: stay on the screen
-        jge  .left_ok
-        mov  word [sprite_x], 0
-.left_ok:
-        cmp  word [sprite_x], SCREEN_W - SPRITE_W
-        jle  .right_ok
-        mov  word [sprite_x], SCREEN_W - SPRITE_W
-.right_ok:
+        cmp  word [mario_x], 0          ; SIGNED: went below 0?
+        jge  .left_end_ok
+        mov  word [mario_x], 0          ; left end of the level
+.left_end_ok:
+        cmp  word [mario_x], LEVEL_W_PX - SPRITE_W
+        jle  .right_end_ok
+        mov  word [mario_x], LEVEL_W_PX - SPRITE_W   ; right end of the level
+.right_end_ok:
         pop  ax
         ret
 
 ; ----------------------------------------------------------------------------
-; DrawWalker
-; Purpose : draw the test sprite; running pose (alternating every 8 frames)
-;           while a direction key is held, standing pose otherwise
-; Inputs  : none        Outputs : none
-; Changes : none (AX preserved)
+; UpdateCamera
+; Purpose : the camera rule of Section 5.3, once per frame after Mario moved:
+;           1 screen_x = mario_x - camera_x
+;           2 if screen_x > 160, wanted camera = mario_x - 160
+;           3 limit it to 640 (level width - screen width)
+;           4 camera never decreases
+;           5 left wall: Mario cannot be left of the camera
+; Inputs  : mario_x, camera_x    Outputs : camera_x, mario_x (left wall)
+; Changes : none (AX, BX preserved)
 ; ----------------------------------------------------------------------------
-DrawWalker:
+UpdateCamera:
         push ax
+        push bx
+        mov  ax, [mario_x]
+        mov  bx, ax
+        sub  bx, [camera_x]             ; BX = Mario's screen x
+        cmp  bx, CAMERA_FOLLOW          ; signed compare
+        jle  .no_follow                 ; at or left of the middle: camera stays
+        sub  ax, CAMERA_FOLLOW          ; AX = wanted camera = mario_x - 160
+        cmp  ax, CAMERA_MAX
+        jbe  .limit_ok
+        mov  ax, CAMERA_MAX             ; end of level: stop scrolling
+.limit_ok:
+        cmp  ax, [camera_x]
+        jbe  .no_follow                 ; never scroll back to the left
+        mov  [camera_x], ax
+.no_follow:
+        mov  ax, [camera_x]
+        cmp  [mario_x], ax
+        jae  .done                      ; Mario is inside the screen
+        mov  [mario_x], ax              ; invisible wall on the left
+        ; (when Mario has a speed variable, set it to 0 here as well)
+.done:
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; ResetCamera
+; Purpose : new life or new game: Mario at the start position, camera at 0
+; Inputs  : none        Outputs : camera_x, mario_x, mario_flags
+; Changes : none
+; ----------------------------------------------------------------------------
+ResetCamera:
+        mov  word [camera_x], 0
+        mov  word [mario_x], MARIO_START_X
+        mov  word [mario_flags], 0
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawMario
+; Purpose : draw Mario at screen_x = world_x - camera_x. Running pose
+;           (alternating every 8 frames) while a direction key is held.
+; Inputs  : none        Outputs : none
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+DrawMario:
+        push ax
+        push bx
         mov  ax, spr_small_stand        ; default: standing
         cmp  byte [key_table + SC_LEFT], 0
         jne  .moving
@@ -729,72 +781,52 @@ DrawWalker:
 .moving:
         test word [frame_counter], 8
         jz   .pose_set
-        mov  ax, spr_small_run          ; swap pose every 8 frames
+        mov  ax, spr_small_run
 .pose_set:
-        push word [sprite_x]            ; x
-        push word 44                    ; y (a free lane between the rows)
+        mov  bx, [mario_x]
+        sub  bx, [camera_x]             ; world x -> screen x
+        push bx                         ; x
+        push word [mario_y]             ; y
         push ax                         ; sprite address
-        push word [walker_flags]        ; mirror when facing left
+        push word [mario_flags]
         call DrawSprite
+        pop  bx
         pop  ax
         ret
 
 ; ----------------------------------------------------------------------------
-; DrawTestWidgets
-; Purpose : (test aid) three lamps for Right / Left Shift / Space, lit while
-;           held, and a bar that grows by one block per real second (max 30)
+; DrawMinimap
+; Purpose : (test aid) a strip across the top: the whole level scaled to 1/4
+;           (240 px), a gold box = the part the camera shows, a red mark = Mario
 ; Inputs  : none        Outputs : none
-; Changes : none (AX, BX, CX, SI preserved)
+; Changes : none (AX preserved)
 ; ----------------------------------------------------------------------------
-DrawTestWidgets:
+DrawMinimap:
         push ax
-        push bx
-        push cx
-        push si
-        xor  bx, bx                     ; BX = lamp number 0..2
-.lamp:
-        mov  al, [lamp_keys + bx]       ; scan code this lamp watches
-        xor  ah, ah
-        mov  si, ax
-        mov  ax, COL_OUTLINE            ; dark = not held
-        cmp  byte [key_table + si], 0
-        je   .draw_lamp
-        mov  ax, COL_COIN               ; gold = held
-.draw_lamp:
-        mov  cx, bx
-        shl  cx, 4                      ; lamp number * 16
-        add  cx, 8                      ; x = 8, 24, 40
-        push cx
-        push word 2                     ; y
-        push word 12                    ; w
-        push word 12                    ; h
-        push ax                         ; colour
+        push word 40                    ; the level track
+        push word 3
+        push word LEVEL_W_PX / 4
+        push word 4
+        push word COL_OUTLINE
         call FillRect
-        inc  bx
-        cmp  bx, 3
-        jb   .lamp
-
-        mov  cx, [game_seconds]         ; seconds bar
-        cmp  cx, 30
-        jbe  .bar_size_ok
-        mov  cx, 30                     ; cap at 30 blocks
-.bar_size_ok:
-        test cx, cx
-        jz   .done
-        mov  bx, 64                     ; x of the first block
-.bar:
-        push bx
-        push word 2
-        push word 6
-        push word 12
-        push word COL_GROUND_TOP
+        mov  ax, [camera_x]
+        shr  ax, 2                      ; scale 1/4
+        add  ax, 40
+        push ax                         ; the camera window (320 / 4 = 80 wide)
+        push word 3
+        push word SCREEN_W / 4
+        push word 4
+        push word COL_COIN
         call FillRect
-        add  bx, 8
-        loop .bar                       ; FillRect keeps CX safe
-.done:
-        pop  si
-        pop  cx
-        pop  bx
+        mov  ax, [mario_x]
+        shr  ax, 2
+        add  ax, 40
+        push ax                         ; Mario's mark
+        push word 1
+        push word 4
+        push word 8
+        push word COL_HERO
+        call FillRect
         pop  ax
         ret
 
@@ -985,27 +1017,36 @@ DrawSprite:
         ret  8
 
 ; ----------------------------------------------------------------------------
-; DrawScene
-; Purpose : draw every sprite listed in scene_table (x, y, address, flags)
-; Inputs  : none
-; Outputs : none
-; Changes : none (AX, BX, CX preserved; DrawSprite keeps CX safe)
+; DrawWorldItems
+; Purpose : draw every object of world_items that is on the screen:
+;           screen_x = world_x - camera_x, drawn only if -16 < screen_x < 320
+; Inputs  : none        Outputs : none
+; Changes : none (AX, BX, CX preserved)
 ; ----------------------------------------------------------------------------
-DrawScene:
+DrawWorldItems:
+        push ax
         push bx
         push cx
-        mov  bx, scene_table            ; BX walks the table
-        mov  cx, SCENE_COUNT            ; how many rows
+        mov  bx, world_items            ; BX walks the table
+        mov  cx, ITEM_COUNT
 .next:
-        push word [bx]                  ; x
+        mov  ax, [bx]                   ; world x
+        sub  ax, [camera_x]             ; AX = screen x (may be negative)
+        cmp  ax, -SPRITE_W
+        jle  .skip                      ; completely off the left side
+        cmp  ax, SCREEN_W
+        jge  .skip                      ; completely off the right side
+        push ax                         ; x on screen
         push word [bx+2]                ; y
         push word [bx+4]                ; sprite address
         push word [bx+6]                ; flags
         call DrawSprite
-        add  bx, 8                      ; next row (4 words)
+.skip:
+        add  bx, 8                      ; next object (4 words)
         loop .next
         pop  cx
         pop  bx
+        pop  ax
         ret
 
 ; ----------------------------------------------------------------------------
@@ -1036,8 +1077,9 @@ SetPalette:
 
 ; ----------------------------------------------------------------------------
 ; FillRect(x, y, w, h, colour)      pushed in that order
-; Purpose : fill a rectangle of pixels in video memory (no clipping yet)
-; Inputs  : [bp+12]=x  [bp+10]=y  [bp+8]=w  [bp+6]=h  [bp+4]=colour
+; Purpose : fill a rectangle of pixels in the draw segment. CLIPS on all four
+;           screen edges, so x may be negative (scrolled tiles) or past 320.
+; Inputs  : [bp+12]=x  [bp+10]=y  [bp+8]=w  [bp+6]=h  [bp+4]=colour  (signed)
 ; Outputs : none
 ; Changes : none (all registers preserved)
 ; ----------------------------------------------------------------------------
@@ -1051,22 +1093,51 @@ FillRect:
         push di
         push es
         mov  es, [draw_seg]             ; ES = where we draw (screen or buffer)
+        mov  ax, [bp+12]                ; AX = x
+        mov  cx, [bp+8]                 ; CX = width
+        test ax, ax
+        jns  .left_ok
+        add  cx, ax                     ; x < 0: cut the part left of the screen
+        xor  ax, ax                     ; start at x = 0
+.left_ok:
+        mov  bx, ax
+        add  bx, cx                     ; BX = right edge
+        cmp  bx, SCREEN_W
+        jle  .right_ok
+        mov  cx, SCREEN_W
+        sub  cx, ax                     ; cut the part right of the screen
+.right_ok:
+        cmp  cx, 0                      ; SIGNED: nothing left to draw?
+        jle  .done
         mov  bx, [bp+10]                ; BX = y
+        mov  dx, [bp+6]                 ; DX = height
+        test bx, bx
+        jns  .top_ok
+        add  dx, bx                     ; y < 0: cut the part above the screen
+        xor  bx, bx
+.top_ok:
+        mov  di, bx
+        add  di, dx                     ; DI = bottom edge
+        cmp  di, SCREEN_H
+        jle  .bottom_ok
+        mov  dx, SCREEN_H
+        sub  dx, bx                     ; cut the part below the screen
+.bottom_ok:
+        cmp  dx, 0
+        jle  .done
         mov  di, bx
         shl  di, 8                      ; y * 256
         shl  bx, 6                      ; y * 64
         add  di, bx                     ; y * 320
-        add  di, [bp+12]                ; + x  -> DI = pixel offset
+        add  di, ax                     ; + x  -> DI = pixel offset
         mov  al, [bp+4]                 ; AL = colour number
-        mov  dx, [bp+6]                 ; DX = lines left
-        test dx, dx
-        jz   .done                      ; height 0: nothing to draw
         cld
 .line:
-        mov  cx, [bp+8]                 ; CX = width
+        push cx                         ; rep stosb uses CX up
         push di                         ; remember start of this line
         rep  stosb                      ; write CX pixels
         pop  di
+        pop  cx
         add  di, SCREEN_W               ; move down one pixel line
         dec  dx
         jnz  .line
@@ -1157,49 +1228,70 @@ GetTile:
 
 ; ----------------------------------------------------------------------------
 ; DrawMap
-; Purpose : draw the 20 x 12 visible tiles (window starts at column 0 today)
-; Inputs  : none (reads working_map)
-; Outputs : none
+; Purpose : draw the visible part of the level, shifted by the camera.
+;           first column = camera_x / 16, pixel offset = camera_x mod 16,
+;           21 columns (20 + one partial), tile x = i*16 - offset.
+; Inputs  : camera_x (reads working_map)    Outputs : none
+; Locals  : [bp-2] = first map column
 ; Changes : none (DrawTile preserves registers, so counters survive calls)
 ; ----------------------------------------------------------------------------
 DrawMap:
+        push bp
+        mov  bp, sp
+        sub  sp, 2
         push ax
         push bx
         push cx
         push dx
         push si
+        push di
+        mov  ax, [camera_x]
+        mov  di, ax
+        and  di, 15                     ; DI = camera_x mod 16 (pixel offset)
+        shr  ax, 4
+        mov  [bp-2], ax                 ; first column = camera_x / 16
         xor  dx, dx                     ; DX = row
 .row_loop:
-        xor  cx, cx                     ; CX = column, reloaded every row
+        mov  ax, dx
+        mov  bx, ax
+        shl  ax, 6                      ; row * 64
+        shl  bx, 2                      ; row * 4
+        sub  ax, bx                     ; row * 60
+        add  ax, [bp-2]                 ; + first column
+        mov  si, ax                     ; SI = map index of the leftmost tile
+        xor  cx, cx                     ; CX = column on screen, reloaded per row
 .col_loop:
-        mov  ax, dx                     ; AX = row
-        mov  bx, MAP_W
-        push dx                         ; MUL destroys DX, so save the row
-        mul  bx                         ; AX = row * 60
-        pop  dx
-        add  ax, cx                     ; + column
-        mov  si, ax
+        mov  ax, [bp-2]
+        add  ax, cx                     ; AX = map column
+        cmp  ax, MAP_W
+        jae  .next_col                  ; past the end of the level: skip
         mov  al, [working_map + si]     ; AL = tile code
         xor  ah, ah
         mov  bx, cx
-        shl  bx, 4                      ; x = column * 16
-        push bx
+        shl  bx, 4                      ; i * 16
+        sub  bx, di                     ; - offset  (negative for column 0)
+        push bx                         ; x
         mov  bx, dx
-        shl  bx, 4                      ; y = row * 16
-        push bx
+        shl  bx, 4
+        push bx                         ; y = row * 16
         push ax                         ; tile code
         call DrawTile
+.next_col:
+        inc  si
         inc  cx
-        cmp  cx, SCREEN_COLS
+        cmp  cx, SCREEN_COLS + 1
         jb   .col_loop
         inc  dx
         cmp  dx, MAP_H
         jb   .row_loop
+        pop  di
         pop  si
         pop  dx
         pop  cx
         pop  bx
         pop  ax
+        mov  sp, bp                     ; drop the local
+        pop  bp
         ret
 
 ; ----------------------------------------------------------------------------
