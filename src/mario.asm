@@ -1,8 +1,7 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 7 reference build
-;  Modules covered: 2 (video, palette, FillRect), 3 (map, tiles), 4 (sprites),
-;                   5 (frame buffer), 6 (camera), 7 (keyboard), 8 (timer),
-;                   9 (player movement and physics, 8.8 fixed point)
+;  MARIO.ASM  -  Super Mario Engine, DAY 8 reference build
+;  Modules covered: 2-8 (video, map, sprites, buffer, camera, keyboard, timer)
+;                   9 (physics) and 10 (collision detection)
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -35,7 +34,13 @@ GRAVITY         equ 0040h               ; 0.25 added to vertical speed each fram
 JUMP_START      equ 0FA80h              ; -5.5 (two's complement)
 JUMP_CUT        equ 0FE00h              ; -2.0 space released while rising
 MAX_FALL        equ 0400h               ; 4.0
-TEST_FLOOR_Y    equ 144                 ; TEST ONLY: top of Mario standing on row 9
+MARIO_START_Y   equ 144                 ; top of Mario standing on row 9 (row 9 * 16)
+HB_OFF          equ 2                   ; hitbox starts 2 pixels inside the sprite
+HB_W            equ 12                  ; hitbox is 12 pixels wide (centred)
+HERO_H_SMALL    equ 16
+HERO_H_SUPER    equ 32
+PIT_Y           equ 192                 ; top of Mario at this y = fell out of the map
+STOMP_BOUNCE    equ 0FD00h              ; -3.0 after defeating an enemy
 FORM_SMALL      equ 0
 FORM_SUPER      equ 1
 
@@ -106,7 +111,7 @@ camera_x       dw 0            ; world x of the left edge of the screen
 ;      velocity is 8.8 fixed point (signed word: high byte = whole pixels)
 mario_x         dw MARIO_START_X ; WORLD x, whole pixels (used for camera/draw)
 mario_xf        db 0            ; fraction of x (0..255 = 0..255/256 pixel)
-mario_y         dw TEST_FLOOR_Y ; y of the top of the sprite, whole pixels
+mario_y         dw MARIO_START_Y ; y of the top of the sprite, whole pixels
 mario_yf        db 0            ; fraction of y
 mario_vx        dw 0            ; horizontal speed, 8.8 signed
 mario_vy        dw 0            ; vertical speed, 8.8 signed (negative = up)
@@ -116,6 +121,19 @@ hp              db 1            ; health 1 or 2
 invuln_timer    dw 0            ; frames of invulnerability left
 stomp_chain     db 0            ; stomps since last touching the ground
 space_was_down  db 0            ; Space state last frame (new press = new jump)
+prev_feet_y     dw 0            ; y of his feet at the start of this frame
+head_timer      db 0            ; frames the "head hit" lamp stays lit
+stomp_timer     db 0            ; frames the "stomp" lamp stays lit (+ grace time)
+hurt_timer      db 0            ; frames the "hurt" lamp stays lit
+flag_touched    db 0            ; 1 once the flag pole was touched
+flag_row        db 0            ; map row of his feet at that moment (2..8)
+
+; test enemies: x, y, width, height (a Goomba and a Koopa standing on row 9)
+hit_targets:
+        dw 300, 144, 16, 16
+        dw 420, 144, 16, 16
+hit_targets_end:
+TARGET_COUNT    equ (hit_targets_end - hit_targets) / 8
 key_table       times 128 db 0  ; 1 = key held, 0 = released (index = scan code)
 tick_count      dw 0            ; +1 on every timer tick (changed by the handler)
 last_tick       dw 0            ; tick_count seen by UpdateClock last frame
@@ -506,6 +524,7 @@ main:
         call WaitTick                   ; 1. wait for the next timer tick
         call UpdateClock                ; 6. count real seconds
         call UpdateMario                ; 2-3. read the key table, move Mario
+        call CheckHazards               ; 5/7. pit, flag pole, enemy contact
         call UpdateCamera               ; 8. follow Mario (Section 5.3)
         call ClearBuffer                ; 9. wipe last frame
         call DrawMap                    ;    tiles, shifted by the camera
@@ -706,11 +725,10 @@ UpdateClock:
 
 ; ----------------------------------------------------------------------------
 ; UpdateMario
-; Purpose : Section 5.2 physics in 8.8 fixed point, once per frame:
-;           accelerate / brake / friction, walk and run limits, facing,
-;           jump (ground only, new press), variable jump height, gravity,
-;           maximum fall speed, move, level ends.
-;           The floor is a TEST floor for now (Module 10 replaces it).
+; Purpose : Section 5.2 physics (8.8 fixed point) + Section 5.6 tile collision.
+;           One axis at a time, X first, then Y:
+;           accelerate/brake/friction -> move X -> ResolveX
+;           -> jump, gravity -> move Y -> ResolveY
 ; Inputs  : key_table and the hero data     Outputs : the hero data
 ; Changes : none (AX, BX, CX, DX preserved)
 ; ----------------------------------------------------------------------------
@@ -719,6 +737,10 @@ UpdateMario:
         push bx
         push cx
         push dx
+
+        call HeroHeight                 ; remember where his feet were this frame
+        add  ax, [mario_y]              ; (the stomp test needs "previous feet")
+        mov  [prev_feet_y], ax
 
         ; ---------- horizontal: which way is the player pushing? ----------
         xor  bx, bx                     ; BX = direction: -1, 0 or +1
@@ -781,7 +803,7 @@ UpdateMario:
 .speed_done:
         mov  [mario_vx], ax
 
-        ; ---------- move horizontally (8.8 speed added to position) ----------
+        ; ---------- move horizontally, then fix collisions on X ----------
         mov  dl, al                     ; DL = fraction part of the speed
         sar  ax, 8                      ; AX = whole part (sign kept)
         add  [mario_xf], dl             ; fractions first: may set the carry
@@ -798,6 +820,7 @@ UpdateMario:
         mov  byte [mario_xf], 0
         mov  word [mario_vx], 0
 .right_end_ok:
+        call ResolveX                   ; walls: never sink into a tile
 
         ; ---------- jump ----------
         cmp  byte [key_table + SC_SPACE], 0
@@ -817,7 +840,7 @@ UpdateMario:
         mov  al, [key_table + SC_SPACE]
         mov  [space_was_down], al       ; remember for next frame
 
-        ; ---------- gravity and vertical move ----------
+        ; ---------- gravity, move vertically, then fix collisions on Y ----------
         mov  ax, [mario_vy]
         add  ax, GRAVITY
         cmp  ax, MAX_FALL
@@ -829,23 +852,544 @@ UpdateMario:
         sar  ax, 8
         add  [mario_yf], dl
         adc  [mario_y], ax
+        call ResolveY                   ; floor, ceiling, on_ground, block hits
 
-        ; ---------- TEST floor (replace with tile collision in Module 10) ----------
-        cmp  word [mario_y], TEST_FLOOR_Y
-        jl   .in_air
-        mov  word [mario_y], TEST_FLOOR_Y
-        mov  byte [mario_yf], 0
-        mov  word [mario_vy], 0
-        mov  byte [on_ground], 1
-        mov  byte [stomp_chain], 0      ; landing resets the stomp chain
-        jmp  .done
-.in_air:
-        mov  byte [on_ground], 0
-.done:
         pop  dx
         pop  cx
         pop  bx
         pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; HeroHeight
+; Purpose : height of Mario's body in pixels (16 small, 32 super)
+; Inputs  : form        Outputs : AX = height
+; Changes : AX only
+; ----------------------------------------------------------------------------
+HeroHeight:
+        mov  ax, HERO_H_SMALL
+        cmp  byte [form], FORM_SMALL
+        je   .done
+        mov  ax, HERO_H_SUPER
+.done:
+        ret
+
+; ----------------------------------------------------------------------------
+; IsSolid(px, py)                   pushed in that order
+; Purpose : is the tile at this WORLD pixel solid? (codes 1..10 are solid;
+;           sky, coin and flag pole are not; outside the level: see GetTile)
+; Inputs  : [bp+6]=px  [bp+4]=py
+; Outputs : AX = 1 solid, 0 not solid
+; Changes : AX only
+; ----------------------------------------------------------------------------
+IsSolid:
+        push bp
+        mov  bp, sp
+        push word [bp+6]
+        push word [bp+4]
+        call GetTile                    ; AX = tile code
+        dec  ax                         ; code 1..10 -> 0..9
+        cmp  ax, TILE_STAIR - TILE_GROUND + 1
+        jae  .no                        ; unsigned: code 0 wraps to a huge number
+        mov  ax, 1
+        jmp  .out
+.no:
+        xor  ax, ax
+.out:
+        pop  bp
+        ret  4
+
+; ----------------------------------------------------------------------------
+; SolidColumn(px)
+; Purpose : is anything solid at x = px, anywhere along Mario's body height?
+;           Samples the top, every 16 pixels, and the bottom pixel row, so a
+;           16 or 32 pixel tall body can never skip over a tile.
+; Inputs  : [bp+4]=px   (also reads mario_y and form)
+; Outputs : AX = 1 solid found, 0 none
+; Changes : AX only
+; ----------------------------------------------------------------------------
+SolidColumn:
+        push bp
+        mov  bp, sp
+        push bx
+        push cx
+        push dx
+        call HeroHeight
+        mov  cx, ax                     ; CX = body height
+        mov  bx, [mario_y]              ; BX = sample row, starts at the head
+        mov  dx, bx
+        add  dx, cx
+        dec  dx                         ; DX = bottom pixel row of the body
+.sample:
+        push word [bp+4]
+        push bx
+        call IsSolid
+        test ax, ax
+        jnz  .out                       ; found one: AX = 1
+        cmp  bx, dx
+        jge  .out                       ; tested the bottom row: AX = 0
+        add  bx, 16                     ; next sample one tile lower
+        cmp  bx, dx
+        jle  .sample
+        mov  bx, dx                     ; past the bottom: test the last row
+        jmp  .sample
+.out:
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; SolidRow(py)
+; Purpose : is anything solid at pixel row py, under Mario's hitbox width?
+;           (hitbox is 12 wide, so its left and right edge points are enough)
+; Inputs  : [bp+4]=py
+; Outputs : AX = 1 solid found, 0 none
+; Changes : AX only
+; ----------------------------------------------------------------------------
+SolidRow:
+        push bp
+        mov  bp, sp
+        push bx
+        mov  bx, [mario_x]
+        add  bx, HB_OFF                 ; BX = left edge of the hitbox
+        push bx
+        push word [bp+4]
+        call IsSolid
+        test ax, ax
+        jnz  .out
+        add  bx, HB_W - 1               ; BX = right edge of the hitbox
+        push bx
+        push word [bp+4]
+        call IsSolid
+.out:
+        pop  bx
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; ResolveX
+; Purpose : after Mario moved sideways, look at the tiles on the side he moves
+;           towards. If one is solid, put him against it and stop him.
+; Inputs  : mario_vx (direction), position    Outputs : mario_x, mario_vx
+; Changes : none (AX, DX preserved)
+; ----------------------------------------------------------------------------
+ResolveX:
+        push ax
+        push dx
+        cmp  word [mario_vx], 0
+        je   .done                      ; not moving sideways
+        jl   .left
+        mov  dx, [mario_x]              ; ---- moving right ----
+        add  dx, HB_OFF + HB_W - 1      ; DX = right edge pixel
+        push dx
+        call SolidColumn
+        test ax, ax
+        jz   .done
+        shr  dx, 4
+        shl  dx, 4                      ; left side of the wall tile
+        sub  dx, HB_OFF + HB_W          ; right edge ends just before it
+        jmp  .snap
+.left:
+        mov  dx, [mario_x]              ; ---- moving left ----
+        add  dx, HB_OFF                 ; DX = left edge pixel
+        push dx
+        call SolidColumn
+        test ax, ax
+        jz   .done
+        shr  dx, 4
+        inc  dx
+        shl  dx, 4                      ; right side of the wall tile
+        sub  dx, HB_OFF                 ; left edge starts just after it
+.snap:
+        mov  [mario_x], dx
+        mov  byte [mario_xf], 0
+        mov  word [mario_vx], 0         ; he stops against the wall
+.done:
+        pop  dx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; ResolveY
+; Purpose : after Mario moved vertically:
+;           rising  -> if his head is inside a solid tile: put him under it,
+;                      stop him and trigger the block (OnHeadHit)
+;           falling -> if his feet are inside a solid tile: put him on top of
+;                      it. Then test the pixel row under his feet to set
+;                      on_ground (and reset the stomp chain).
+;           Falling out of the map sets nothing here (CheckHazards: pit).
+; Inputs  : mario_vy, position    Outputs : mario_y, mario_vy, on_ground
+; Changes : none (AX, BX, CX preserved)
+; ----------------------------------------------------------------------------
+ResolveY:
+        push ax
+        push bx
+        push cx
+        call HeroHeight
+        mov  cx, ax                     ; CX = body height
+        cmp  word [mario_vy], 0
+        jl   .rising
+
+        mov  bx, [mario_y]              ; ---- falling or resting ----
+        add  bx, cx
+        dec  bx                         ; BX = pixel row of the feet
+        push bx
+        call SolidRow
+        test ax, ax
+        jz   .check_ground
+        shr  bx, 4
+        shl  bx, 4                      ; top of the tile the feet are in
+        sub  bx, cx                     ; y = tile top - body height
+        mov  [mario_y], bx
+        mov  byte [mario_yf], 0
+        mov  word [mario_vy], 0
+.check_ground:
+        mov  bx, [mario_y]
+        add  bx, cx                     ; BX = pixel row just under the feet
+        push bx
+        call SolidRow
+        test ax, ax
+        jz   .air
+        mov  byte [on_ground], 1        ; something solid is right below
+        mov  byte [stomp_chain], 0      ; landing resets the stomp chain
+        mov  word [mario_vy], 0         ; resting: no gravity build-up
+        mov  byte [mario_yf], 0
+        jmp  .done
+.air:
+        mov  byte [on_ground], 0
+        jmp  .done
+
+.rising:
+        mov  byte [on_ground], 0
+        mov  bx, [mario_y]              ; BX = pixel row of the head
+        push bx
+        call SolidRow
+        test ax, ax
+        jz   .done
+        mov  ax, [mario_x]              ; the block is the tile under the
+        add  ax, HB_OFF + HB_W / 2      ; horizontal CENTRE of the head
+        shr  ax, 4                      ; AX = column
+        push ax
+        mov  ax, bx
+        shr  ax, 4                      ; AX = row of the head
+        push ax
+        shr  bx, 4
+        inc  bx
+        shl  bx, 4                      ; bottom edge of the tile above him
+        mov  [mario_y], bx              ; head just under the tile
+        mov  byte [mario_yf], 0
+        mov  word [mario_vy], 0         ; he starts falling
+        call OnHeadHit                  ; (col, row) already pushed
+.done:
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; OnHeadHit(col, row)               pushed in that order
+; Purpose : Mario's head hit the tile (col,row) from below. PLACEHOLDER for
+;           Module 12: "?" blocks just become empty blocks, nothing else.
+; Inputs  : [bp+6]=col  [bp+4]=row
+; Outputs : head_timer set (test lamp); working_map may change
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+OnHeadHit:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        mov  byte [head_timer], 10      ; lights the test lamp
+        cmp  word [bp+6], MAP_W
+        jae  .out                       ; outside the map: nothing to change
+        cmp  word [bp+4], MAP_H
+        jae  .out
+        mov  bx, [bp+4]
+        mov  ax, bx
+        shl  ax, 6
+        shl  bx, 2
+        sub  ax, bx                     ; row * 60
+        add  ax, [bp+6]                 ; + column
+        mov  bx, ax                     ; BX = map index
+        mov  al, [working_map + bx]
+        cmp  al, TILE_Q_COIN
+        je   .empty
+        cmp  al, TILE_Q_MUSH
+        jne  .out
+.empty:
+        mov  byte [working_map + bx], TILE_EMPTY
+.out:
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  4
+
+; ----------------------------------------------------------------------------
+; RectOverlap(ax, ay, aw, ah, bx, by, bw, bh)   pushed in that order
+; Purpose : do rectangle A and rectangle B overlap? (touching edges do not)
+; Inputs  : [bp+18]=ax [bp+16]=ay [bp+14]=aw [bp+12]=ah
+;           [bp+10]=bx [bp+8]=by  [bp+6]=bw  [bp+4]=bh   (signed words)
+; Outputs : AX = 1 overlap, 0 none
+; Changes : AX only
+; ----------------------------------------------------------------------------
+RectOverlap:
+        push bp
+        mov  bp, sp
+        mov  ax, [bp+18]
+        add  ax, [bp+14]                ; right edge of A
+        cmp  ax, [bp+10]
+        jle  .no                        ; A ends before B starts
+        mov  ax, [bp+10]
+        add  ax, [bp+6]                 ; right edge of B
+        cmp  ax, [bp+18]
+        jle  .no                        ; B ends before A starts
+        mov  ax, [bp+16]
+        add  ax, [bp+12]                ; bottom of A
+        cmp  ax, [bp+8]
+        jle  .no
+        mov  ax, [bp+8]
+        add  ax, [bp+4]                 ; bottom of B
+        cmp  ax, [bp+16]
+        jle  .no
+        mov  ax, 1
+        jmp  .out
+.no:
+        xor  ax, ax
+.out:
+        pop  bp
+        ret  16
+
+; ----------------------------------------------------------------------------
+; ClassifyContact(prev_feet, enemy_y, enemy_h)   pushed in that order
+; Purpose : Mario overlaps an enemy: stomp or hurt? (Section 5.6)
+;           Stomp = Mario is moving down AND in the previous frame his feet
+;           were above the upper half of the enemy.
+; Inputs  : [bp+8]=prev_feet  [bp+6]=enemy top y  [bp+4]=enemy height
+;           (and mario_vy)
+; Outputs : AX = 1 stomp, 0 hurt
+; Changes : AX only
+; ----------------------------------------------------------------------------
+ClassifyContact:
+        push bp
+        mov  bp, sp
+        cmp  word [mario_vy], 0
+        jle  .hurt                      ; not moving down: cannot be a stomp
+        mov  ax, [bp+4]
+        shr  ax, 1                      ; half the enemy height
+        add  ax, [bp+6]                 ; AX = y of the enemy's middle
+        cmp  [bp+8], ax
+        jg   .hurt                      ; feet were already below the middle
+        mov  ax, 1
+        jmp  .out
+.hurt:
+        xor  ax, ax
+.out:
+        pop  bp
+        ret  6
+
+; ----------------------------------------------------------------------------
+; TileIsFlag(px, py)
+; Purpose : is the tile at this world pixel the flag pole?
+; Inputs  : [bp+6]=px  [bp+4]=py        Outputs : AX = 1 flag, 0 not
+; Changes : AX only
+; ----------------------------------------------------------------------------
+TileIsFlag:
+        push bp
+        mov  bp, sp
+        push word [bp+6]
+        push word [bp+4]
+        call GetTile
+        cmp  ax, TILE_FLAG
+        jne  .no
+        mov  ax, 1
+        jmp  .out
+.no:
+        xor  ax, ax
+.out:
+        pop  bp
+        ret  4
+
+; ----------------------------------------------------------------------------
+; ProbeFlagColumn(px)
+; Purpose : is there flag pole at x = px at Mario's head, middle or feet?
+; Inputs  : [bp+4]=px        Outputs : AX = 1 yes, 0 no
+; Changes : AX only
+; ----------------------------------------------------------------------------
+ProbeFlagColumn:
+        push bp
+        mov  bp, sp
+        push bx
+        push cx
+        call HeroHeight
+        dec  ax
+        mov  cx, ax                     ; CX = height - 1
+        mov  bx, [mario_y]              ; BX = head row
+        push word [bp+4]
+        push bx
+        call TileIsFlag
+        test ax, ax
+        jnz  .out
+        mov  ax, cx
+        shr  ax, 1
+        add  ax, bx                     ; middle row
+        push word [bp+4]
+        push ax
+        call TileIsFlag
+        test ax, ax
+        jnz  .out
+        add  bx, cx                     ; bottom row
+        push word [bp+4]
+        push bx
+        call TileIsFlag                 ; its result is the answer
+.out:
+        pop  cx
+        pop  bx
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; ContactWithTarget(ptr)
+; Purpose : test Mario against one entry (x, y, w, h) of hit_targets:
+;           overlap? then stomp (bounce up, chain + 1) or hurt (test lamp).
+;           For 12 frames after a stomp, contact is ignored (like the kick
+;           grace time) so the bounce cannot count as a hit.
+; Inputs  : [bp+4]=address of the (x, y, w, h) record
+; Outputs : stomp_timer / hurt_timer, mario_vy, stomp_chain
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+ContactWithTarget:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        mov  bx, [bp+4]
+        mov  ax, [mario_x]
+        add  ax, HB_OFF
+        push ax                         ; hero hitbox: x
+        push word [mario_y]             ;               y
+        push word HB_W                  ;               w
+        call HeroHeight
+        push ax                         ;               h
+        push word [bx]                  ; target: x
+        push word [bx+2]                ;         y
+        push word [bx+4]                ;         w
+        push word [bx+6]                ;         h
+        call RectOverlap
+        test ax, ax
+        jz   .out
+        cmp  byte [stomp_timer], 0
+        jne  .out                       ; just bounced: ignore
+        push word [prev_feet_y]
+        push word [bx+2]
+        push word [bx+6]
+        call ClassifyContact
+        test ax, ax
+        jz   .hurt
+        mov  word [mario_vy], STOMP_BOUNCE      ; defeated: bounce up
+        mov  byte [stomp_timer], 12
+        inc  byte [stomp_chain]
+        jmp  .out
+.hurt:
+        mov  byte [hurt_timer], 12      ; (real damage comes in Module 11)
+.out:
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; CheckHazards
+; Purpose : once per frame after Mario moved:
+;           - count down the test-lamp timers
+;           - pit: top of Mario at y >= 192 -> respawn (Module 15 will do the
+;             real death sequence)
+;           - flag pole touched? remember the row of his feet for scoring
+;           - contact with the test enemies (stomp or hurt)
+; Inputs  : the hero data     Outputs : lamps/timers, flag_touched, flag_row
+; Changes : none (AX, BX, CX preserved)
+; ----------------------------------------------------------------------------
+CheckHazards:
+        push ax
+        push bx
+        push cx
+        cmp  byte [head_timer], 0
+        je   .t1
+        dec  byte [head_timer]
+.t1:
+        cmp  byte [stomp_timer], 0
+        je   .t2
+        dec  byte [stomp_timer]
+.t2:
+        cmp  byte [hurt_timer], 0
+        je   .t3
+        dec  byte [hurt_timer]
+.t3:
+        cmp  word [mario_y], PIT_Y      ; SIGNED: fell below the map?
+        jl   .no_pit
+        call ResetHero                  ; test only: back to the start
+        jmp  .done
+.no_pit:
+        cmp  byte [flag_touched], 0
+        jne  .contacts                  ; already touched
+        mov  ax, [mario_x]
+        add  ax, HB_OFF
+        push ax
+        call ProbeFlagColumn            ; left edge of the hitbox
+        test ax, ax
+        jnz  .flag_hit
+        mov  ax, [mario_x]
+        add  ax, HB_OFF + HB_W - 1
+        push ax
+        call ProbeFlagColumn            ; right edge of the hitbox
+        test ax, ax
+        jz   .contacts
+.flag_hit:
+        mov  byte [flag_touched], 1
+        call HeroHeight
+        add  ax, [mario_y]
+        dec  ax                         ; pixel row of his feet
+        shr  ax, 4                      ; map row (2..8 gives the points)
+        mov  [flag_row], al
+.contacts:
+        mov  bx, hit_targets
+        mov  cx, TARGET_COUNT
+.next_target:
+        push bx
+        call ContactWithTarget
+        add  bx, 8                      ; next record (4 words)
+        loop .next_target
+.done:
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; ResetHero
+; Purpose : new life or new game: Mario at the start with no speed, standing,
+;           camera at 0, test flags cleared
+; Inputs  : none        Outputs : the hero data and camera_x
+; Changes : none
+; ----------------------------------------------------------------------------
+ResetHero:
+        mov  word [camera_x], 0
+        mov  word [mario_x], MARIO_START_X
+        mov  byte [mario_xf], 0
+        mov  word [mario_y], MARIO_START_Y
+        mov  byte [mario_yf], 0
+        mov  word [mario_vx], 0
+        mov  word [mario_vy], 0
+        mov  byte [on_ground], 1
+        mov  byte [stomp_chain], 0
+        mov  word [mario_flags], 0
+        mov  byte [space_was_down], 0
+        mov  byte [head_timer], 0
+        mov  byte [stomp_timer], 0
+        mov  byte [hurt_timer], 0
+        mov  byte [flag_touched], 0
+        mov  byte [flag_row], 0
         ret
 
 ; ----------------------------------------------------------------------------
@@ -885,27 +1429,6 @@ UpdateCamera:
 .done:
         pop  bx
         pop  ax
-        ret
-
-; ----------------------------------------------------------------------------
-; ResetHero
-; Purpose : new life or new game: Mario at the start with no speed, standing,
-;           camera at 0
-; Inputs  : none        Outputs : the hero data and camera_x
-; Changes : none
-; ----------------------------------------------------------------------------
-ResetHero:
-        mov  word [camera_x], 0
-        mov  word [mario_x], MARIO_START_X
-        mov  byte [mario_xf], 0
-        mov  word [mario_y], TEST_FLOOR_Y
-        mov  byte [mario_yf], 0
-        mov  word [mario_vx], 0
-        mov  word [mario_vy], 0
-        mov  byte [on_ground], 1
-        mov  byte [stomp_chain], 0
-        mov  word [mario_flags], 0
-        mov  byte [space_was_down], 0
         ret
 
 ; ----------------------------------------------------------------------------
@@ -977,25 +1500,70 @@ DrawMinimap:
         ret
 
 ; ----------------------------------------------------------------------------
+; DrawLamp(y, colour, lit)          pushed in that order
+; Purpose : (test aid) a 12 x 12 lamp at x = 8: coloured when lit, dark if not
+; Inputs  : [bp+8]=y  [bp+6]=colour when lit  [bp+4]=lit (0 = dark)
+; Outputs : none        Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawLamp:
+        push bp
+        mov  bp, sp
+        push ax
+        mov  ax, COL_OUTLINE
+        cmp  word [bp+4], 0
+        je   .dark
+        mov  ax, [bp+6]
+.dark:
+        push word 8
+        push word [bp+8]
+        push word 12
+        push word 12
+        push ax
+        call FillRect
+        pop  ax
+        pop  bp
+        ret  6
+
+; ----------------------------------------------------------------------------
 ; DrawPhysicsBars
-; Purpose : (test aid) a lamp that is lit while Mario is on the ground, and a
-;           bar whose length is his horizontal speed (|vx| / 8 pixels)
+; Purpose : (test aid) five lamps down the left side, and a speed bar:
+;           1 on ground   2 head hit   3 stomp   4 hurt   5 flag touched
+;           bar length = |vx| / 8 pixels
 ; Inputs  : none        Outputs : none
 ; Changes : none (AX preserved)
 ; ----------------------------------------------------------------------------
 DrawPhysicsBars:
         push ax
-        mov  ax, COL_OUTLINE            ; dark = in the air
-        cmp  byte [on_ground], 0
-        je   .lamp
-        mov  ax, COL_GROUND_TOP         ; green = on the ground
-.lamp:
-        push word 8
-        push word 2
-        push word 12
-        push word 12
+        push word 2                     ; lamp 1: on the ground
+        push word COL_GROUND_TOP
+        xor  ax, ax
+        mov  al, [on_ground]
         push ax
-        call FillRect
+        call DrawLamp
+        push word 16                    ; lamp 2: head hit a block
+        push word COL_COIN
+        xor  ax, ax
+        mov  al, [head_timer]
+        push ax
+        call DrawLamp
+        push word 30                    ; lamp 3: stomped an enemy
+        push word COL_PIPE_LIGHT
+        xor  ax, ax
+        mov  al, [stomp_timer]
+        push ax
+        call DrawLamp
+        push word 44                    ; lamp 4: hurt by an enemy
+        push word COL_HERO
+        xor  ax, ax
+        mov  al, [hurt_timer]
+        push ax
+        call DrawLamp
+        push word 58                    ; lamp 5: flag pole touched
+        push word COL_TEXT
+        xor  ax, ax
+        mov  al, [flag_touched]
+        push ax
+        call DrawLamp
         mov  ax, [mario_vx]
         test ax, ax
         jns  .positive
