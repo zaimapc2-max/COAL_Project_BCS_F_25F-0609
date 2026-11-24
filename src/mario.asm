@@ -1,7 +1,8 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 8 reference build
-;  Modules covered: 2-8 (video, map, sprites, buffer, camera, keyboard, timer)
-;                   9 (physics) and 10 (collision detection)
+;  MARIO.ASM  -  Super Mario Engine, DAY 9 reference build
+;  Modules covered: 2-8 (video, map, sprites, buffer, camera, keyboard, timer),
+;                   9 (physics), 10 (collision),
+;                   12 (blocks, coins, mushroom)  + AddScore (part of 13)
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -35,6 +36,20 @@ JUMP_START      equ 0FA80h              ; -5.5 (two's complement)
 JUMP_CUT        equ 0FE00h              ; -2.0 space released while rising
 MAX_FALL        equ 0400h               ; 4.0
 MARIO_START_Y   equ 144                 ; top of Mario standing on row 9 (row 9 * 16)
+MAX_LIVES       equ 99
+START_LIVES     equ 3
+MUSH_MAX        equ 4                   ; mushrooms alive at once
+MUSH_REC        equ 12                  ; bytes per mushroom record (6 words)
+M_ACTIVE        equ 0                   ; record fields (byte offsets)
+M_X             equ 2                   ;   world x
+M_Y             equ 4                   ;   world y (top)
+M_YF            equ 6                   ;   fraction of y (low byte used)
+M_VY            equ 8                   ;   vertical speed, 8.8
+M_DIR           equ 10                  ;   +1 right, -1 left
+POP_MAX         equ 4                   ; coin pop-ups at once
+POP_REC         equ 6                   ; bytes per pop-up record: x, y, timer
+POP_FRAMES      equ 16                  ; how long a coin pop-up lives
+
 HB_OFF          equ 2                   ; hitbox starts 2 pixels inside the sprite
 HB_W            equ 12                  ; hitbox is 12 pixels wide (centred)
 HERO_H_SMALL    equ 16
@@ -128,6 +143,22 @@ hurt_timer      db 0            ; frames the "hurt" lamp stays lit
 flag_touched    db 0            ; 1 once the flag pole was touched
 flag_row        db 0            ; map row of his feet at that moment (2..8)
 
+; ---- score, coins, lives (Module 13 will draw them as numbers)
+score_lo        dw 0            ; 32-bit score = score_hi:score_lo
+score_hi        dw 0
+coins           db 0            ; 0..99
+lives           db START_LIVES  ; 1..99
+
+; which sprite for which pose: stand, run, jump (one word each)
+small_poses     dw spr_small_stand, spr_small_run, spr_small_jump
+super_poses     dw spr_super_stand, spr_super_run, spr_super_jump
+
+; ---- entities (kept together so ClearEntities can wipe them in one go)
+entities_start:
+mushrooms:      times MUSH_MAX * MUSH_REC db 0
+pops:           times POP_MAX * POP_REC db 0
+entities_end:
+
 ; test enemies: x, y, width, height (a Goomba and a Koopa standing on row 9)
 hit_targets:
         dw 300, 144, 16, 16
@@ -182,7 +213,7 @@ tile_colour:
         db COL_PIPE             ; 8  pipe body-left
         db COL_PIPE             ; 9  pipe body-right
         db COL_GROUND_TOP       ; 10 stair block
-        db COL_COIN             ; 11 coin
+        db COL_SKY              ; 11 coin (the coin sprite is drawn on top)
         db COL_TEXT             ; 12 flag pole
 
 ; level map, 60 x 12, one row per line. Never changed after assembly.
@@ -485,13 +516,8 @@ SPRITE_BYTES    equ sprites_end - sprites_start
 ; Their positions are in the level, not on the screen. DrawWorldItems converts
 ; each one with  screen_x = world_x - camera_x  and skips those off screen.
 world_items:
-        dw 200,  96, spr_coin,     0
         dw 300, 144, spr_goomba,   0
-        dw 344,  96, spr_coin,     0
         dw 420, 144, spr_koopa,    0
-        dw 600, 144, spr_mushroom, 0
-        dw 700, 144, spr_goomba,   0
-        dw 840, 112, spr_coin,     0
 world_items_end:
 ITEM_COUNT      equ (world_items_end - world_items) / 8   ; 4 words = 8 bytes
 
@@ -518,25 +544,31 @@ main:
         call DecodeSprites
         call ResetMap
         call InstallHandlers            ; keyboard + timer are ours from here on
-        call ResetHero                  ; Mario at the start, camera at 0
+        call NewGame                    ; score 0, 3 lives, level, Mario
 
 .frame:
         call WaitTick                   ; 1. wait for the next timer tick
         call UpdateClock                ; 6. count real seconds
         call UpdateMario                ; 2-3. read the key table, move Mario
+        call UpdateMushrooms            ; 4. mushrooms walk and fall
+        call UpdatePops                 ;    coin pop-ups rise
         call CheckHazards               ; 5/7. pit, flag pole, enemy contact
+        call CollectItems               ; 5. coin tiles, mushrooms
         call UpdateCamera               ; 8. follow Mario (Section 5.3)
         call ClearBuffer                ; 9. wipe last frame
         call DrawMap                    ;    tiles, shifted by the camera
         call DrawWorldItems             ;    objects placed in the level
+        call DrawMushrooms
+        call DrawPops
         call DrawMario
         call DrawMinimap                ;    test aid: where the camera is
         call DrawPhysicsBars            ;    test aid: on ground + speed
+        call DrawStatusBars             ;    test aid: score, coins, lives
         call CopyBuffer                 ; 10. ONE copy to the screen per frame
         inc  word [frame_counter]
         cmp  byte [key_table + SC_ENTER], 0
         je   .no_restart
-        call ResetHero                  ; Enter: back to the start
+        call NewGame                    ; Enter: a completely new game
 .no_restart:
         cmp  byte [key_table + SC_ESC], 0
         je   .frame
@@ -1090,10 +1122,13 @@ ResolveY:
 
 ; ----------------------------------------------------------------------------
 ; OnHeadHit(col, row)               pushed in that order
-; Purpose : Mario's head hit the tile (col,row) from below. PLACEHOLDER for
-;           Module 12: "?" blocks just become empty blocks, nothing else.
+; Purpose : Mario's head hit the tile (col,row) from below (Section 5.9):
+;           brick       small Mario: nothing.  Super Mario: tile becomes sky, +50
+;           "?" coin    becomes an empty block, coin pops out (+200, coins +1)
+;           "?" mushroom becomes an empty block, a mushroom appears on top
+;           anything else: nothing.  All changes are made in working_map only.
 ; Inputs  : [bp+6]=col  [bp+4]=row
-; Outputs : head_timer set (test lamp); working_map may change
+; Outputs : working_map, score, coins, mushroom table, head_timer (test lamp)
 ; Changes : none (AX, BX preserved)
 ; ----------------------------------------------------------------------------
 OnHeadHit:
@@ -1112,19 +1147,556 @@ OnHeadHit:
         shl  bx, 2
         sub  ax, bx                     ; row * 60
         add  ax, [bp+6]                 ; + column
-        mov  bx, ax                     ; BX = map index
+        mov  bx, ax                     ; BX = map index of the hit tile
         mov  al, [working_map + bx]
         cmp  al, TILE_Q_COIN
-        je   .empty
+        je   .coin_block
         cmp  al, TILE_Q_MUSH
-        jne  .out
-.empty:
+        je   .mushroom_block
+        cmp  al, TILE_BRICK
+        jne  .out                       ; empty block, ground ...: nothing
+        cmp  byte [form], FORM_SUPER
+        jne  .out                       ; small Mario only bumps a brick
+        mov  byte [working_map + bx], TILE_SKY   ; Super Mario breaks it
+        push word 50
+        call AddScore                   ; +50
+        jmp  .out
+.coin_block:
         mov  byte [working_map + bx], TILE_EMPTY
+        call AddCoin                    ; +200 and coins + 1
+        mov  ax, [bp+6]
+        shl  ax, 4                      ; x of the block
+        push ax
+        mov  ax, [bp+4]
+        dec  ax
+        shl  ax, 4                      ; y of the tile above the block
+        push ax
+        call SpawnCoinPop               ; the little coin that jumps out
+        jmp  .out
+.mushroom_block:
+        mov  byte [working_map + bx], TILE_EMPTY
+        push word [bp+6]
+        push word [bp+4]
+        call SpawnMushroom
 .out:
         pop  bx
         pop  ax
         pop  bp
         ret  4
+
+; ----------------------------------------------------------------------------
+; AddScore(points)
+; Purpose : the ONE place where points are added (Section 5.4). 32-bit score
+;           in two words with ADD / ADC, clamped to 999,999.
+; Inputs  : [bp+4]=points (0..65535)
+; Outputs : score_lo, score_hi
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+AddScore:
+        push bp
+        mov  bp, sp
+        push ax
+        mov  ax, [bp+4]
+        add  [score_lo], ax             ; low word first ...
+        adc  word [score_hi], 0         ; ... then the high word + the carry
+        cmp  word [score_hi], 0Fh       ; 999,999 = 000F423Fh
+        jb   .done
+        ja   .clamp
+        cmp  word [score_lo], 423Fh
+        jbe  .done
+.clamp:
+        mov  word [score_hi], 0Fh
+        mov  word [score_lo], 423Fh
+.done:
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; AddLife
+; Purpose : one more life, never more than 99
+; Inputs  : none        Outputs : lives        Changes : none
+; ----------------------------------------------------------------------------
+AddLife:
+        cmp  byte [lives], MAX_LIVES
+        jae  .done
+        inc  byte [lives]
+.done:
+        ret
+
+; ----------------------------------------------------------------------------
+; AddCoin
+; Purpose : a coin was collected: +200 points, coins + 1. At 100 coins the
+;           counter returns to 0 and Mario gets a life (no points for that).
+; Inputs  : none        Outputs : score, coins, lives        Changes : none
+; ----------------------------------------------------------------------------
+AddCoin:
+        push word 200
+        call AddScore
+        inc  byte [coins]
+        cmp  byte [coins], 100
+        jb   .done
+        mov  byte [coins], 0
+        call AddLife
+.done:
+        ret
+
+; ----------------------------------------------------------------------------
+; SpawnCoinPop(x, y)                pushed in that order
+; Purpose : start the little coin animation that rises out of a "?" block
+;           (WORLD position; it rises 2 pixels per frame for 16 frames)
+; Inputs  : [bp+6]=x  [bp+4]=y        Outputs : pops table
+; Changes : none (BX, CX preserved)
+; ----------------------------------------------------------------------------
+SpawnCoinPop:
+        push bp
+        mov  bp, sp
+        push bx
+        push cx
+        mov  bx, pops
+        mov  cx, POP_MAX
+.find:
+        cmp  word [bx+4], 0             ; timer 0 = free slot
+        je   .found
+        add  bx, POP_REC
+        loop .find
+        jmp  .out                       ; all busy: skip the animation
+.found:
+        mov  cx, [bp+6]
+        mov  [bx], cx                   ; x
+        mov  cx, [bp+4]
+        mov  [bx+2], cx                 ; y
+        mov  word [bx+4], POP_FRAMES    ; timer
+.out:
+        pop  cx
+        pop  bx
+        pop  bp
+        ret  4
+
+; ----------------------------------------------------------------------------
+; UpdatePops
+; Purpose : move every active coin pop-up up by 2 pixels, count its timer down
+; Inputs  : none        Outputs : pops table        Changes : none
+; ----------------------------------------------------------------------------
+UpdatePops:
+        push bx
+        push cx
+        mov  bx, pops
+        mov  cx, POP_MAX
+.next:
+        cmp  word [bx+4], 0
+        je   .skip
+        sub  word [bx+2], 2             ; rise
+        dec  word [bx+4]
+.skip:
+        add  bx, POP_REC
+        loop .next
+        pop  cx
+        pop  bx
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawPops
+; Purpose : draw the active coin pop-ups (screen_x = world_x - camera_x)
+; Inputs  : none        Outputs : none        Changes : none
+; ----------------------------------------------------------------------------
+DrawPops:
+        push ax
+        push bx
+        push cx
+        mov  bx, pops
+        mov  cx, POP_MAX
+.next:
+        cmp  word [bx+4], 0
+        je   .skip
+        mov  ax, [bx]
+        sub  ax, [camera_x]             ; screen x
+        cmp  ax, -SPRITE_W
+        jle  .skip
+        cmp  ax, SCREEN_W
+        jge  .skip
+        push ax
+        push word [bx+2]
+        push word spr_coin
+        push word 0
+        call DrawSprite
+.skip:
+        add  bx, POP_REC
+        loop .next
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; SpawnMushroom(col, row)           pushed in that order
+; Purpose : put a mushroom on top of the "?" block at (col,row). It starts
+;           moving to the right. If all 4 slots are busy nothing happens.
+; Inputs  : [bp+6]=col  [bp+4]=row        Outputs : mushroom table
+; Changes : none (AX, BX, CX preserved)
+; ----------------------------------------------------------------------------
+SpawnMushroom:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        mov  bx, mushrooms
+        mov  cx, MUSH_MAX
+.find:
+        cmp  word [bx+M_ACTIVE], 0
+        je   .found
+        add  bx, MUSH_REC
+        loop .find
+        jmp  .out                       ; table full
+.found:
+        mov  word [bx+M_ACTIVE], 1
+        mov  ax, [bp+6]
+        shl  ax, 4
+        mov  [bx+M_X], ax               ; same column as the block
+        mov  ax, [bp+4]
+        dec  ax
+        shl  ax, 4
+        mov  [bx+M_Y], ax               ; the tile row above the block
+        mov  word [bx+M_YF], 0
+        mov  word [bx+M_VY], 0
+        mov  word [bx+M_DIR], 1         ; moving right
+.out:
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  4
+
+; ----------------------------------------------------------------------------
+; UpdateMushrooms
+; Purpose : update every active mushroom (Section 5.9)
+; Inputs  : none        Outputs : mushroom table        Changes : none
+; ----------------------------------------------------------------------------
+UpdateMushrooms:
+        push bx
+        push cx
+        mov  bx, mushrooms
+        mov  cx, MUSH_MAX
+.next:
+        push bx
+        call UpdateOneMushroom
+        add  bx, MUSH_REC
+        loop .next
+        pop  cx
+        pop  bx
+        ret
+
+; ----------------------------------------------------------------------------
+; UpdateOneMushroom(ptr)
+; Purpose : one mushroom: walk 1 pixel per frame, turn around at walls,
+;           gravity, land on solid tiles, disappear in a pit or when it is far
+;           to the left of the screen.
+; Inputs  : [bp+4]=address of the record
+; Outputs : the record        Changes : none (AX, BX, CX, DX preserved)
+; ----------------------------------------------------------------------------
+UpdateOneMushroom:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        mov  bx, [bp+4]
+        cmp  word [bx+M_ACTIVE], 0
+        jne  .alive                     ; .out is too far for ONE short jump,
+        jmp  .out                       ; so: jump over a JMP (JMP reaches anywhere)
+.alive:
+        mov  ax, [bx+M_DIR]             ; ---- walk (+1 right / -1 left) ----
+        add  [bx+M_X], ax
+        mov  cx, [bx+M_X]               ; CX = x of the leading edge
+        test ax, ax
+        jl   .edge_ready
+        add  cx, 15                     ; moving right: right edge
+.edge_ready:
+        push cx
+        push word [bx+M_Y]              ; top of the body
+        call IsSolid
+        test ax, ax
+        jnz  .hit_wall
+        mov  dx, [bx+M_Y]
+        add  dx, 15                     ; bottom of the body
+        push cx
+        push dx
+        call IsSolid
+        test ax, ax
+        jz   .no_wall
+.hit_wall:
+        mov  ax, [bx+M_DIR]
+        sub  [bx+M_X], ax               ; undo the step
+        neg  word [bx+M_DIR]            ; and turn around
+.no_wall:
+
+        mov  ax, [bx+M_VY]              ; ---- gravity and fall ----
+        add  ax, GRAVITY
+        cmp  ax, MAX_FALL
+        jle  .fall_ok
+        mov  ax, MAX_FALL
+.fall_ok:
+        mov  [bx+M_VY], ax
+        mov  dl, al
+        sar  ax, 8
+        add  [bx+M_YF], dl              ; fractions first, then whole pixels
+        adc  [bx+M_Y], ax
+        mov  cx, [bx+M_Y]
+        add  cx, 15                     ; CX = pixel row of its feet
+        push word [bx+M_X]
+        push cx
+        call IsSolid
+        test ax, ax
+        jnz  .land
+        mov  ax, [bx+M_X]
+        add  ax, 15
+        push ax
+        push cx
+        call IsSolid
+        test ax, ax
+        jz   .no_land
+.land:
+        shr  cx, 4
+        shl  cx, 4                      ; top of the tile its feet are in
+        sub  cx, 16
+        mov  [bx+M_Y], cx               ; stand on it
+        mov  byte [bx+M_YF], 0
+        mov  word [bx+M_VY], 0
+.no_land:
+
+        cmp  word [bx+M_Y], PIT_Y       ; ---- fell into a pit ----
+        jl   .not_in_pit
+        mov  word [bx+M_ACTIVE], 0
+        jmp  .out
+.not_in_pit:
+        mov  ax, [bx+M_X]               ; ---- far to the left of the screen ----
+        sub  ax, [camera_x]
+        cmp  ax, -32
+        jge  .out
+        mov  word [bx+M_ACTIVE], 0
+.out:
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; GrowMario
+; Purpose : Small -> Super (HP 2). His FEET stay where they are, so the top of
+;           the taller sprite moves up: y_top = y_feet - height (16 higher).
+; Inputs  : none        Outputs : form, hp, mario_y        Changes : none
+; ----------------------------------------------------------------------------
+GrowMario:
+        mov  byte [form], FORM_SUPER
+        mov  byte [hp], 2
+        sub  word [mario_y], HERO_H_SUPER - HERO_H_SMALL
+        ret
+
+; ----------------------------------------------------------------------------
+; CollectCoins
+; Purpose : every coin tile that Mario's body overlaps is collected:
+;           tile becomes sky, +200, coins + 1 (AddCoin)
+; Inputs  : mario position, form        Outputs : working_map, score, coins
+; Changes : none (all registers preserved)
+; ----------------------------------------------------------------------------
+CollectCoins:
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        call HeroHeight
+        add  ax, [mario_y]
+        dec  ax                         ; AX = bottom pixel row of the body
+        test ax, ax
+        js   .out                       ; completely above the map
+        shr  ax, 4
+        cmp  ax, MAP_H
+        jb   .last_row_ok
+        mov  ax, MAP_H - 1
+.last_row_ok:
+        mov  dx, ax                     ; DX = last map row touched
+        mov  ax, [mario_y]
+        test ax, ax
+        jns  .first_row_ok
+        xor  ax, ax
+.first_row_ok:
+        shr  ax, 4
+        mov  bx, ax                     ; BX = first map row touched
+        cmp  bx, dx
+        ja   .out                       ; below the map (falling into a pit)
+        mov  si, [mario_x]
+        add  si, HB_OFF                 ; left edge of the hitbox
+        mov  cx, si
+        add  cx, HB_W - 1               ; right edge
+        shr  si, 4                      ; SI = first column
+        shr  cx, 4                      ; CX = last column
+.row_loop:
+        mov  di, si                     ; DI = column, restarts every row
+.col_loop:
+        mov  ax, bx
+        shl  ax, 6
+        push bx
+        shl  bx, 2
+        sub  ax, bx                     ; row * 60
+        pop  bx
+        add  ax, di                     ; + column = map index
+        push bx
+        mov  bx, ax
+        cmp  byte [working_map + bx], TILE_COIN
+        jne  .no_coin
+        mov  byte [working_map + bx], TILE_SKY
+        call AddCoin
+.no_coin:
+        pop  bx
+        inc  di
+        cmp  di, cx
+        jbe  .col_loop
+        inc  bx
+        cmp  bx, dx
+        jbe  .row_loop
+.out:
+        pop  di
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; CollectItems
+; Purpose : step 5 of the frame order for items: coin tiles, and mushrooms.
+;           A mushroom that overlaps Mario: +1000, and Small becomes Super
+;           (if he is already Super, only the points).
+; Inputs  : none        Outputs : score, coins, form, mushroom table
+; Changes : none (AX, BX, CX preserved)
+; ----------------------------------------------------------------------------
+CollectItems:
+        push ax
+        push bx
+        push cx
+        call CollectCoins
+        mov  bx, mushrooms
+        mov  cx, MUSH_MAX
+.next:
+        cmp  word [bx+M_ACTIVE], 0
+        je   .skip
+        mov  ax, [mario_x]
+        add  ax, HB_OFF
+        push ax                         ; Mario's hitbox: x
+        push word [mario_y]             ;                 y
+        push word HB_W                  ;                 w
+        call HeroHeight
+        push ax                         ;                 h
+        push word [bx+M_X]              ; mushroom: x
+        push word [bx+M_Y]              ;           y
+        push word 16                    ;           w
+        push word 16                    ;           h
+        call RectOverlap
+        test ax, ax
+        jz   .skip
+        mov  word [bx+M_ACTIVE], 0      ; collected
+        push word 1000
+        call AddScore
+        cmp  byte [form], FORM_SMALL
+        jne  .skip                      ; already Super: points only
+        call GrowMario
+.skip:
+        add  bx, MUSH_REC
+        loop .next
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawMushrooms
+; Purpose : draw every active mushroom that is on the screen
+; Inputs  : none        Outputs : none        Changes : none
+; ----------------------------------------------------------------------------
+DrawMushrooms:
+        push ax
+        push bx
+        push cx
+        mov  bx, mushrooms
+        mov  cx, MUSH_MAX
+.next:
+        cmp  word [bx+M_ACTIVE], 0
+        je   .skip
+        mov  ax, [bx+M_X]
+        sub  ax, [camera_x]             ; screen x
+        cmp  ax, -SPRITE_W
+        jle  .skip
+        cmp  ax, SCREEN_W
+        jge  .skip
+        push ax
+        push word [bx+M_Y]
+        push word spr_mushroom
+        push word 0
+        call DrawSprite
+.skip:
+        add  bx, MUSH_REC
+        loop .next
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; ClearEntities
+; Purpose : remove all mushrooms and coin pop-ups (they are stored together)
+; Inputs  : none        Outputs : tables set to 0
+; Changes : none (AX, CX, DI, ES preserved)
+; ----------------------------------------------------------------------------
+ClearEntities:
+        push ax
+        push cx
+        push di
+        push es
+        push cs
+        pop  es                         ; ES = our own segment (not the buffer!)
+        xor  ax, ax
+        mov  di, entities_start
+        mov  cx, (entities_end - entities_start) / 2
+        cld
+        rep  stosw
+        pop  es
+        pop  di
+        pop  cx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; ResetLevel
+; Purpose : level back to its start (used after a death): map restored from
+;           the original, mushrooms and pop-ups removed, Mario at the start
+;           as Small Mario. Score and coins are KEPT.
+; Inputs  : none        Outputs : many        Changes : none
+; ----------------------------------------------------------------------------
+ResetLevel:
+        call ResetMap
+        call ClearEntities
+        call ResetHero
+        ret
+
+; ----------------------------------------------------------------------------
+; NewGame
+; Purpose : everything from scratch: score 0, coins 0, 3 lives, then the level
+; Inputs  : none        Outputs : many        Changes : none
+; ----------------------------------------------------------------------------
+NewGame:
+        mov  word [score_lo], 0
+        mov  word [score_hi], 0
+        mov  byte [coins], 0
+        mov  byte [lives], START_LIVES
+        call ResetLevel
+        ret
 
 ; ----------------------------------------------------------------------------
 ; RectOverlap(ax, ay, aw, ah, bx, by, bw, bh)   pushed in that order
@@ -1328,7 +1900,7 @@ CheckHazards:
 .t3:
         cmp  word [mario_y], PIT_Y      ; SIGNED: fell below the map?
         jl   .no_pit
-        call ResetHero                  ; test only: back to the start
+        call ResetLevel                 ; test: map, mushrooms, Mario back to the start
         jmp  .done
 .no_pit:
         cmp  byte [flag_touched], 0
@@ -1364,32 +1936,6 @@ CheckHazards:
         pop  cx
         pop  bx
         pop  ax
-        ret
-
-; ----------------------------------------------------------------------------
-; ResetHero
-; Purpose : new life or new game: Mario at the start with no speed, standing,
-;           camera at 0, test flags cleared
-; Inputs  : none        Outputs : the hero data and camera_x
-; Changes : none
-; ----------------------------------------------------------------------------
-ResetHero:
-        mov  word [camera_x], 0
-        mov  word [mario_x], MARIO_START_X
-        mov  byte [mario_xf], 0
-        mov  word [mario_y], MARIO_START_Y
-        mov  byte [mario_yf], 0
-        mov  word [mario_vx], 0
-        mov  word [mario_vy], 0
-        mov  byte [on_ground], 1
-        mov  byte [stomp_chain], 0
-        mov  word [mario_flags], 0
-        mov  byte [space_was_down], 0
-        mov  byte [head_timer], 0
-        mov  byte [stomp_timer], 0
-        mov  byte [hurt_timer], 0
-        mov  byte [flag_touched], 0
-        mov  byte [flag_row], 0
         ret
 
 ; ----------------------------------------------------------------------------
@@ -1433,32 +1979,45 @@ UpdateCamera:
 
 ; ----------------------------------------------------------------------------
 ; DrawMario
-; Purpose : draw Mario at screen_x = world_x - camera_x with the right pose:
-;           jumping sprite in the air, running sprite (alternating every 8
-;           frames) while he moves on the ground, standing sprite otherwise
+; Purpose : draw Mario at screen_x = world_x - camera_x. Pose: jumping sprite
+;           in the air, running sprite (alternating every 8 frames) while he
+;           moves, standing sprite otherwise. Super Mario uses the 16 x 32
+;           sprites (SPR_TALL); mario_y is the TOP of the body, so when he
+;           grows his feet stay where they were.
 ; Inputs  : none        Outputs : none
-; Changes : none (AX, BX preserved)
+; Changes : none (AX, BX, CX preserved)
 ; ----------------------------------------------------------------------------
 DrawMario:
         push ax
         push bx
-        mov  ax, spr_small_jump
+        push cx
+        mov  bx, 4                      ; pose offset in the table: 4 = jumping
         cmp  byte [on_ground], 0
-        je   .pose_set                  ; in the air
-        mov  ax, spr_small_stand
+        je   .pose_set
+        xor  bx, bx                     ; 0 = standing
         cmp  word [mario_vx], 0
-        je   .pose_set                  ; standing still
+        je   .pose_set
         test word [frame_counter], 8
         jz   .pose_set
-        mov  ax, spr_small_run          ; swap pose every 8 frames
+        mov  bx, 2                      ; 2 = running
 .pose_set:
+        mov  ax, [mario_flags]          ; AX = flags (mirror when facing left)
+        cmp  byte [form], FORM_SUPER
+        je   .super
+        mov  cx, [small_poses + bx]     ; CX = address of the small sprite
+        jmp  .draw
+.super:
+        or   ax, SPR_TALL               ; 16 x 32
+        mov  cx, [super_poses + bx]
+.draw:
         mov  bx, [mario_x]
         sub  bx, [camera_x]             ; world x -> screen x
         push bx                         ; x
-        push word [mario_y]             ; y
-        push ax                         ; sprite address
-        push word [mario_flags]
+        push word [mario_y]             ; y (top)
+        push cx                         ; sprite address
+        push ax                         ; flags
         call DrawSprite
+        pop  cx
         pop  bx
         pop  ax
         ret
@@ -1576,6 +2135,66 @@ DrawPhysicsBars:
         push word 4
         push word COL_COIN
         call FillRect                   ; width 0 draws nothing
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawStatusBars
+; Purpose : (test aid until the HUD exists in Module 13)
+;           top bar    score / 50 pixels (max 240)
+;           2nd bar    coins, 1 pixel each
+;           3rd bar    lives, 4 pixels each
+;           lamp 6     lit while Mario is Super
+; Inputs  : none        Outputs : none
+; Changes : none (AX, CX, DX preserved)
+; ----------------------------------------------------------------------------
+DrawStatusBars:
+        push ax
+        push cx
+        push dx
+        mov  dx, [score_hi]
+        mov  ax, [score_lo]
+        mov  cx, 50
+        div  cx                         ; AX = score / 50 (always fits: <= 19999)
+        cmp  ax, 240
+        jbe  .score_ok
+        mov  ax, 240
+.score_ok:
+        push word 40
+        push word 17
+        push ax
+        push word 4
+        push word COL_COIN
+        call FillRect
+        xor  ax, ax
+        mov  al, [coins]
+        push word 40
+        push word 23
+        push ax
+        push word 4
+        push word COL_TEXT
+        call FillRect
+        xor  ax, ax
+        mov  al, [lives]
+        shl  ax, 2
+        cmp  ax, 240
+        jbe  .lives_ok
+        mov  ax, 240
+.lives_ok:
+        push word 40
+        push word 29
+        push ax
+        push word 4
+        push word COL_HERO
+        call FillRect
+        push word 72                    ; lamp 6: Super Mario
+        push word COL_PIPE
+        xor  ax, ax
+        mov  al, [form]
+        push ax
+        call DrawLamp
+        pop  dx
+        pop  cx
         pop  ax
         ret
 
@@ -2025,6 +2644,18 @@ DrawMap:
         push bx                         ; y = row * 16
         push ax                         ; tile code
         call DrawTile
+        cmp  ax, TILE_COIN              ; AX still holds the tile code
+        jne  .next_col
+        mov  bx, cx
+        shl  bx, 4
+        sub  bx, di
+        push bx                         ; x
+        mov  bx, dx
+        shl  bx, 4
+        push bx                         ; y
+        push word spr_coin
+        push word 0
+        call DrawSprite                 ; the coin picture on the sky tile
 .next_col:
         inc  si
         inc  cx
@@ -2072,4 +2703,32 @@ ResetMap:
         pop  si
         pop  cx
         pop  ax
+        ret
+; ----------------------------------------------------------------------------
+; ResetHero
+; Purpose : Mario at the start as Small Mario with no speed, standing,
+;           camera at 0, test flags cleared
+; Inputs  : none        Outputs : the hero data and camera_x
+; Changes : none
+; ----------------------------------------------------------------------------
+ResetHero:
+        mov  word [camera_x], 0
+        mov  word [mario_x], MARIO_START_X
+        mov  byte [mario_xf], 0
+        mov  word [mario_y], MARIO_START_Y
+        mov  byte [mario_yf], 0
+        mov  word [mario_vx], 0
+        mov  word [mario_vy], 0
+        mov  byte [on_ground], 1
+        mov  byte [form], FORM_SMALL    ; after a death he is always Small
+        mov  byte [hp], 1
+        mov  word [invuln_timer], 0
+        mov  byte [stomp_chain], 0
+        mov  word [mario_flags], 0
+        mov  byte [space_was_down], 0
+        mov  byte [head_timer], 0
+        mov  byte [stomp_timer], 0
+        mov  byte [hurt_timer], 0
+        mov  byte [flag_touched], 0
+        mov  byte [flag_row], 0
         ret
