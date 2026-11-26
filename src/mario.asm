@@ -1,8 +1,16 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 9 reference build
-;  Modules covered: 2-8 (video, map, sprites, buffer, camera, keyboard, timer),
-;                   9 (physics), 10 (collision),
-;                   12 (blocks, coins, mushroom)  + AddScore (part of 13)
+;  MARIO.ASM  -  Super Mario Engine, DAY 11 reference build
+;  Modules covered: 2-8, 9 (physics), 10 (collision), 12 (blocks, items),
+;                   13 (score, HUD), 11 (enemies and shells)
+;  Build:  nasm -f bin mario.asm -o MARIO.COM
+;  Test :  Six enemies (4 Goombas, 2 Koopas) walk towards Mario once the
+;          camera comes near. Stomp them (jump on top), kick shells, hit them
+;          with a sliding shell (+500 each). Side contact hurts: Super Mario
+;          becomes Small and blinks for 2 s, Small Mario dies (level restarts
+;          until Module 15 adds the real death sequence).
+;          Debug keys: T clock to 5 s   C coins to 99   D test overlay
+;          Left/Right = move, Shift = run, Space = jump,
+;          Enter = new game, Esc = quit (through Shutdown).
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -36,6 +44,44 @@ JUMP_START      equ 0FA80h              ; -5.5 (two's complement)
 JUMP_CUT        equ 0FE00h              ; -2.0 space released while rising
 MAX_FALL        equ 0400h               ; 4.0
 MARIO_START_Y   equ 144                 ; top of Mario standing on row 9 (row 9 * 16)
+EN_MAX          equ 8                   ; enemy slots (at most 8 active at once)
+EN_REC          equ 18                  ; bytes per enemy record (9 words)
+E_TYPE          equ 0                   ; 0 = free, 1 = Goomba, 2 = Koopa
+E_X             equ 2                   ; world x   (same layout as a mushroom
+E_Y             equ 4                   ; world y     record for these first
+E_YF            equ 6                   ; y fraction  six words, so FallEntity
+E_VY            equ 8                   ; vertical speed 8.8   works for both)
+E_DIR           equ 10                  ; +1 right, -1 left
+E_STATE         equ 12                  ; see ST_... below
+E_XF            equ 14                  ; x fraction (speeds are below 1 px/frame)
+E_TIMER         equ 16                  ; flat time / grace time
+T_GOOMBA        equ 1
+T_KOOPA         equ 2
+ST_WAIT         equ 0                   ; stands still until the camera is near
+ST_WALK         equ 1
+ST_FLAT         equ 2                   ; squashed Goomba
+ST_SHELL        equ 3                   ; stationary shell
+ST_SLIDE        equ 4                   ; sliding shell
+GOOMBA_SPEED    equ 0080h               ; 0.5  px/frame
+KOOPA_SPEED     equ 00C0h               ; 0.75 px/frame
+SHELL_SPEED     equ 0300h               ; 3.0  px/frame
+FLAT_FRAMES     equ 30                  ; a flat Goomba stays about 1 second
+KICK_GRACE      equ 8                   ; a kicked shell ignores Mario this long
+SHELL_GRACE     equ 10                  ; a stomped Koopa's shell, same idea
+INVULN_FRAMES   equ 60                  ; 2 seconds at 30 frames per second
+ACTIVATE_MARGIN equ 16                  ; wake up one tile before the screen edge
+CULL_LEFT       equ 32                  ; this far left of the screen = removed
+STOMP_BOUNCE_HIGH equ 0FB80h            ; -4.5 bounce when Space is held
+
+FONT_W          equ 5                   ; font characters are 5 x 7 pixels
+FONT_H          equ 7
+CHAR_ADV        equ 6                   ; 5 pixels + 1 gap between characters
+HUD_H           equ 16                  ; the HUD strip is 16 pixels tall
+START_TIME      equ 300                 ; seconds on the clock at the start of a life
+SC_T            equ 14h                 ; debug keys
+SC_C            equ 2Eh
+SC_D            equ 20h
+
 MAX_LIVES       equ 99
 START_LIVES     equ 3
 MUSH_MAX        equ 4                   ; mushrooms alive at once
@@ -143,7 +189,11 @@ hurt_timer      db 0            ; frames the "hurt" lamp stays lit
 flag_touched    db 0            ; 1 once the flag pole was touched
 flag_row        db 0            ; map row of his feet at that moment (2..8)
 
-; ---- score, coins, lives (Module 13 will draw them as numbers)
+time_left       dw START_TIME   ; the level clock, counts down 300 -> 0
+debug_on        db 0            ; 1 = test overlay visible
+d_was_down      db 0            ; D key state last frame (toggle once per press)
+
+; ---- score, coins, lives (shown by DrawHUD)
 score_lo        dw 0            ; 32-bit score = score_hi:score_lo
 score_hi        dw 0
 coins           db 0            ; 0..99
@@ -157,14 +207,97 @@ super_poses     dw spr_super_stand, spr_super_run, spr_super_jump
 entities_start:
 mushrooms:      times MUSH_MAX * MUSH_REC db 0
 pops:           times POP_MAX * POP_REC db 0
+enemies:        times EN_MAX * EN_REC db 0
 entities_end:
 
-; test enemies: x, y, width, height (a Goomba and a Koopa standing on row 9)
-hit_targets:
-        dw 300, 144, 16, 16
-        dw 420, 144, 16, 16
-hit_targets_end:
-TARGET_COUNT    equ (hit_targets_end - hit_targets) / 8
+; speed of each kind of enemy (8.8), indexed by type * 2
+enemy_speed     dw 0, GOOMBA_SPEED, KOOPA_SPEED
+
+; points for consecutive stomps in one jump (the 11th and later: a 1-UP)
+chain_points    dw 100, 200, 400, 500, 800, 1000, 2000, 4000, 5000, 8000
+
+; where the enemies start: type, x, y   (4 Goombas and 2 Koopas, all on the
+; ground, y = 144). Placed so every rule can be tested: a Goomba and a Koopa
+; near the pits and pipes, two enemies that meet each other.
+enemy_start:
+        dw T_GOOMBA, 176, 144           ; early, easy to stomp
+        dw T_GOOMBA, 300, 144
+        dw T_KOOPA,  420, 144           ; its platform ends at the pit
+        dw T_GOOMBA, 560, 144           ; walks off the edge into the pit
+        dw T_KOOPA,  700, 144           ; meets the next Goomba
+        dw T_GOOMBA, 730, 144
+enemy_start_end:
+ENEMY_COUNT     equ (enemy_start_end - enemy_start) / 6
+
+; ---------------- font: 5 x 7 pixels per character ----------------
+; 7 bytes per character (one byte per row), the 5 low bits of each byte are
+; the pixels (1 = draw), leftmost pixel = bit 4. Order: 0-9, A-Z, '-', blank.
+; The binary numbers look like the letters, so you can see and edit them.
+GLYPH_DASH      equ 36                  ; index of '-'
+GLYPH_BLANK     equ 37                  ; index of the empty character
+font_data:
+        ; ---- digits ----
+        db 01110b, 10001b, 10011b, 10101b, 11001b, 10001b, 01110b   ; 0
+        db 00100b, 01100b, 00100b, 00100b, 00100b, 00100b, 01110b   ; 1
+        db 01110b, 10001b, 00001b, 00010b, 00100b, 01000b, 11111b   ; 2
+        db 11110b, 00001b, 00001b, 01110b, 00001b, 00001b, 11110b   ; 3
+        db 00010b, 00110b, 01010b, 10010b, 11111b, 00010b, 00010b   ; 4
+        db 11111b, 10000b, 11110b, 00001b, 00001b, 10001b, 01110b   ; 5
+        db 00110b, 01000b, 10000b, 11110b, 10001b, 10001b, 01110b   ; 6
+        db 11111b, 00001b, 00010b, 00100b, 01000b, 01000b, 01000b   ; 7
+        db 01110b, 10001b, 10001b, 01110b, 10001b, 10001b, 01110b   ; 8
+        db 01110b, 10001b, 10001b, 01111b, 00001b, 00010b, 01100b   ; 9
+        ; ---- letters ----
+        db 01110b, 10001b, 10001b, 11111b, 10001b, 10001b, 10001b   ; A
+        db 11110b, 10001b, 10001b, 11110b, 10001b, 10001b, 11110b   ; B
+        db 01110b, 10001b, 10000b, 10000b, 10000b, 10001b, 01110b   ; C
+        db 11110b, 10001b, 10001b, 10001b, 10001b, 10001b, 11110b   ; D
+        db 11111b, 10000b, 10000b, 11110b, 10000b, 10000b, 11111b   ; E
+        db 11111b, 10000b, 10000b, 11110b, 10000b, 10000b, 10000b   ; F
+        db 01110b, 10001b, 10000b, 10111b, 10001b, 10001b, 01111b   ; G
+        db 10001b, 10001b, 10001b, 11111b, 10001b, 10001b, 10001b   ; H
+        db 01110b, 00100b, 00100b, 00100b, 00100b, 00100b, 01110b   ; I
+        db 00111b, 00010b, 00010b, 00010b, 00010b, 10010b, 01100b   ; J
+        db 10001b, 10010b, 10100b, 11000b, 10100b, 10010b, 10001b   ; K
+        db 10000b, 10000b, 10000b, 10000b, 10000b, 10000b, 11111b   ; L
+        db 10001b, 11011b, 10101b, 10101b, 10001b, 10001b, 10001b   ; M
+        db 10001b, 11001b, 10101b, 10011b, 10001b, 10001b, 10001b   ; N
+        db 01110b, 10001b, 10001b, 10001b, 10001b, 10001b, 01110b   ; O
+        db 11110b, 10001b, 10001b, 11110b, 10000b, 10000b, 10000b   ; P
+        db 01110b, 10001b, 10001b, 10001b, 10101b, 10010b, 01101b   ; Q
+        db 11110b, 10001b, 10001b, 11110b, 10100b, 10010b, 10001b   ; R
+        db 01111b, 10000b, 10000b, 01110b, 00001b, 00001b, 11110b   ; S
+        db 11111b, 00100b, 00100b, 00100b, 00100b, 00100b, 00100b   ; T
+        db 10001b, 10001b, 10001b, 10001b, 10001b, 10001b, 01110b   ; U
+        db 10001b, 10001b, 10001b, 10001b, 10001b, 01010b, 00100b   ; V
+        db 10001b, 10001b, 10001b, 10101b, 10101b, 10101b, 01010b   ; W
+        db 10001b, 10001b, 01010b, 00100b, 01010b, 10001b, 10001b   ; X
+        db 10001b, 10001b, 01010b, 00100b, 00100b, 00100b, 00100b   ; Y
+        db 11111b, 00001b, 00010b, 00100b, 01000b, 10000b, 11111b   ; Z
+        ; ---- punctuation ----
+        db 00000b, 00000b, 00000b, 11111b, 00000b, 00000b, 00000b   ; -
+        db 00000b, 00000b, 00000b, 00000b, 00000b, 00000b, 00000b   ; (blank)
+
+; the heart icon: 7 pixels wide, 6 rows (bit 6 = leftmost pixel)
+HEART_H         equ 6
+heart_data:
+        db 0110110b
+        db 1111111b
+        db 1111111b
+        db 0111110b
+        db 0011100b
+        db 0001000b
+
+; HUD texts (end with 0)
+str_score       db 'SCORE', 0
+str_coins       db 'COINS', 0
+str_world       db 'WORLD', 0
+str_world_val   db '1-1', 0
+str_time        db 'TIME', 0
+str_lives       db 'LIVES', 0
+str_hp          db 'HP', 0
+
+
 key_table       times 128 db 0  ; 1 = key held, 0 = released (index = scan code)
 tick_count      dw 0            ; +1 on every timer tick (changed by the handler)
 last_tick       dw 0            ; tick_count seen by UpdateClock last frame
@@ -512,20 +645,20 @@ spr_coin:
 sprites_end:
 SPRITE_BYTES    equ sprites_end - sprites_start
 
-; ---------------- world objects: WORLD x, y, sprite, flags ----------------
-; Their positions are in the level, not on the screen. DrawWorldItems converts
-; each one with  screen_x = world_x - camera_x  and skips those off screen.
-world_items:
-        dw 300, 144, spr_goomba,   0
-        dw 420, 144, spr_koopa,    0
-world_items_end:
-ITEM_COUNT      equ (world_items_end - world_items) / 8   ; 4 words = 8 bytes
 
 
 ; ============================================================================
 ;  CODE
 ; ============================================================================
 main:
+        jmp  .start                     ; skip the error exit below
+.no_memory:                             ; (placed here so every jump to it is SHORT)
+        mov  dx, msg_no_memory          ; still in text mode: print and leave
+        mov  ah, 9
+        int  21h
+        mov  ax, 4C01h
+        int  21h
+.start:
         ; ---- memory: shrink our block, then allocate the frame buffer ----
         mov  ah, 4Ah                    ; DOS: resize memory block (ES = our PSP)
         mov  bx, KEEP_PARAS             ; keep 64 KB for code, data and stack
@@ -550,22 +683,29 @@ main:
         call WaitTick                   ; 1. wait for the next timer tick
         call UpdateClock                ; 6. count real seconds
         call UpdateMario                ; 2-3. read the key table, move Mario
-        call UpdateMushrooms            ; 4. mushrooms walk and fall
+        call UpdateEnemies              ; 4. enemies and shells
+        call UpdateMushrooms            ;    mushrooms walk and fall
         call UpdatePops                 ;    coin pop-ups rise
-        call CheckHazards               ; 5/7. pit, flag pole, enemy contact
+        call CheckHazards               ; 7. pit, clock, flag pole
+        call CheckEnemies               ; 5. stomp, kick, hurt
         call CollectItems               ; 5. coin tiles, mushrooms
         call UpdateCamera               ; 8. follow Mario (Section 5.3)
         call ClearBuffer                ; 9. wipe last frame
         call DrawMap                    ;    tiles, shifted by the camera
-        call DrawWorldItems             ;    objects placed in the level
+        call DrawEnemies
         call DrawMushrooms
         call DrawPops
         call DrawMario
-        call DrawMinimap                ;    test aid: where the camera is
-        call DrawPhysicsBars            ;    test aid: on ground + speed
-        call DrawStatusBars             ;    test aid: score, coins, lives
+        call DrawHUD                    ;    the heads-up display (always on top)
+        cmp  byte [debug_on], 0
+        je   .no_overlay
+        call DrawMinimap                ;    test aids (key D)
+        call DrawPhysicsBars
+        call DrawStatusBars
+.no_overlay:
         call CopyBuffer                 ; 10. ONE copy to the screen per frame
         inc  word [frame_counter]
+        call HandleDebugKeys
         cmp  byte [key_table + SC_ENTER], 0
         je   .no_restart
         call NewGame                    ; Enter: a completely new game
@@ -574,12 +714,6 @@ main:
         je   .frame
         jmp  Shutdown                   ; the ONLY way out of the game
 
-.no_memory:                             ; handlers are not installed yet
-        mov  dx, msg_no_memory          ; still in text mode: print and leave
-        mov  ah, 9
-        int  21h
-        mov  ax, 4C01h
-        int  21h
 
 ; ----------------------------------------------------------------------------
 ; KeyboardHandler  (hardware interrupt INT 09h)
@@ -749,6 +883,11 @@ UpdateClock:
         jb   .done
         sub  word [sec_acc], TICKS_PER_SEC
         inc  word [game_seconds]        ; one real second has passed
+        cmp  byte [flag_touched], 0
+        jne  .more                      ; clock is frozen after the flag pole
+        cmp  word [time_left], 0
+        je   .more
+        dec  word [time_left]           ; the level clock: one less every second
         jmp  .more
 .done:
         pop  bx
@@ -1390,8 +1529,7 @@ UpdateMushrooms:
 ; ----------------------------------------------------------------------------
 ; UpdateOneMushroom(ptr)
 ; Purpose : one mushroom: walk 1 pixel per frame, turn around at walls,
-;           gravity, land on solid tiles, disappear in a pit or when it is far
-;           to the left of the screen.
+;           fall (FallEntity), disappear when far to the left of the screen.
 ; Inputs  : [bp+4]=address of the record
 ; Outputs : the record        Changes : none (AX, BX, CX, DX preserved)
 ; ----------------------------------------------------------------------------
@@ -1404,9 +1542,8 @@ UpdateOneMushroom:
         push dx
         mov  bx, [bp+4]
         cmp  word [bx+M_ACTIVE], 0
-        jne  .alive                     ; .out is too far for ONE short jump,
-        jmp  .out                       ; so: jump over a JMP (JMP reaches anywhere)
-.alive:
+        je   .out
+
         mov  ax, [bx+M_DIR]             ; ---- walk (+1 right / -1 left) ----
         add  [bx+M_X], ax
         mov  cx, [bx+M_X]               ; CX = x of the leading edge
@@ -1431,49 +1568,13 @@ UpdateOneMushroom:
         sub  [bx+M_X], ax               ; undo the step
         neg  word [bx+M_DIR]            ; and turn around
 .no_wall:
-
-        mov  ax, [bx+M_VY]              ; ---- gravity and fall ----
-        add  ax, GRAVITY
-        cmp  ax, MAX_FALL
-        jle  .fall_ok
-        mov  ax, MAX_FALL
-.fall_ok:
-        mov  [bx+M_VY], ax
-        mov  dl, al
-        sar  ax, 8
-        add  [bx+M_YF], dl              ; fractions first, then whole pixels
-        adc  [bx+M_Y], ax
-        mov  cx, [bx+M_Y]
-        add  cx, 15                     ; CX = pixel row of its feet
-        push word [bx+M_X]
-        push cx
-        call IsSolid
-        test ax, ax
-        jnz  .land
-        mov  ax, [bx+M_X]
-        add  ax, 15
-        push ax
-        push cx
-        call IsSolid
-        test ax, ax
-        jz   .no_land
-.land:
-        shr  cx, 4
-        shl  cx, 4                      ; top of the tile its feet are in
-        sub  cx, 16
-        mov  [bx+M_Y], cx               ; stand on it
-        mov  byte [bx+M_YF], 0
-        mov  word [bx+M_VY], 0
-.no_land:
-
-        cmp  word [bx+M_Y], PIT_Y       ; ---- fell into a pit ----
-        jl   .not_in_pit
-        mov  word [bx+M_ACTIVE], 0
-        jmp  .out
-.not_in_pit:
-        mov  ax, [bx+M_X]               ; ---- far to the left of the screen ----
+        push bx
+        call FallEntity                 ; gravity, landing, pits
+        cmp  word [bx+M_ACTIVE], 0
+        je   .out                       ; fell into a pit
+        mov  ax, [bx+M_X]               ; far to the left of the screen?
         sub  ax, [camera_x]
-        cmp  ax, -32
+        cmp  ax, -CULL_LEFT
         jge  .out
         mov  word [bx+M_ACTIVE], 0
 .out:
@@ -1682,7 +1783,10 @@ ClearEntities:
 ResetLevel:
         call ResetMap
         call ClearEntities
+        call ResetEnemies               ; enemies back at their start positions
         call ResetHero
+        mov  word [time_left], START_TIME   ; the clock starts again at 300
+        mov  word [sec_acc], 0              ; and the first second is a whole one
         ret
 
 ; ----------------------------------------------------------------------------
@@ -1822,70 +1926,16 @@ ProbeFlagColumn:
         ret  2
 
 ; ----------------------------------------------------------------------------
-; ContactWithTarget(ptr)
-; Purpose : test Mario against one entry (x, y, w, h) of hit_targets:
-;           overlap? then stomp (bounce up, chain + 1) or hurt (test lamp).
-;           For 12 frames after a stomp, contact is ignored (like the kick
-;           grace time) so the bounce cannot count as a hit.
-; Inputs  : [bp+4]=address of the (x, y, w, h) record
-; Outputs : stomp_timer / hurt_timer, mario_vy, stomp_chain
-; Changes : none (AX, BX preserved)
-; ----------------------------------------------------------------------------
-ContactWithTarget:
-        push bp
-        mov  bp, sp
-        push ax
-        push bx
-        mov  bx, [bp+4]
-        mov  ax, [mario_x]
-        add  ax, HB_OFF
-        push ax                         ; hero hitbox: x
-        push word [mario_y]             ;               y
-        push word HB_W                  ;               w
-        call HeroHeight
-        push ax                         ;               h
-        push word [bx]                  ; target: x
-        push word [bx+2]                ;         y
-        push word [bx+4]                ;         w
-        push word [bx+6]                ;         h
-        call RectOverlap
-        test ax, ax
-        jz   .out
-        cmp  byte [stomp_timer], 0
-        jne  .out                       ; just bounced: ignore
-        push word [prev_feet_y]
-        push word [bx+2]
-        push word [bx+6]
-        call ClassifyContact
-        test ax, ax
-        jz   .hurt
-        mov  word [mario_vy], STOMP_BOUNCE      ; defeated: bounce up
-        mov  byte [stomp_timer], 12
-        inc  byte [stomp_chain]
-        jmp  .out
-.hurt:
-        mov  byte [hurt_timer], 12      ; (real damage comes in Module 11)
-.out:
-        pop  bx
-        pop  ax
-        pop  bp
-        ret  2
-
-; ----------------------------------------------------------------------------
 ; CheckHazards
 ; Purpose : once per frame after Mario moved:
-;           - count down the test-lamp timers
-;           - pit: top of Mario at y >= 192 -> respawn (Module 15 will do the
-;             real death sequence)
+;           - count down the lamp timers and the invulnerability timer
+;           - clock at 0 or pit (top of Mario at y >= 192): Mario dies
 ;           - flag pole touched? remember the row of his feet for scoring
-;           - contact with the test enemies (stomp or hurt)
-; Inputs  : the hero data     Outputs : lamps/timers, flag_touched, flag_row
-; Changes : none (AX, BX, CX preserved)
+; Inputs  : the hero data     Outputs : timers, flag_touched, flag_row
+; Changes : none (AX preserved)
 ; ----------------------------------------------------------------------------
 CheckHazards:
         push ax
-        push bx
-        push cx
         cmp  byte [head_timer], 0
         je   .t1
         dec  byte [head_timer]
@@ -1898,13 +1948,22 @@ CheckHazards:
         je   .t3
         dec  byte [hurt_timer]
 .t3:
+        cmp  word [invuln_timer], 0
+        je   .t4
+        dec  word [invuln_timer]        ; the 2 seconds of blinking run out
+.t4:
+        cmp  word [time_left], 0        ; clock at 0: dies, whatever his health
+        jne  .time_ok
+        call HeroDies
+        jmp  .done
+.time_ok:
         cmp  word [mario_y], PIT_Y      ; SIGNED: fell below the map?
         jl   .no_pit
-        call ResetLevel                 ; test: map, mushrooms, Mario back to the start
+        call HeroDies
         jmp  .done
 .no_pit:
         cmp  byte [flag_touched], 0
-        jne  .contacts                  ; already touched
+        jne  .done                      ; already touched
         mov  ax, [mario_x]
         add  ax, HB_OFF
         push ax
@@ -1916,7 +1975,7 @@ CheckHazards:
         push ax
         call ProbeFlagColumn            ; right edge of the hitbox
         test ax, ax
-        jz   .contacts
+        jz   .done
 .flag_hit:
         mov  byte [flag_touched], 1
         call HeroHeight
@@ -1924,17 +1983,7 @@ CheckHazards:
         dec  ax                         ; pixel row of his feet
         shr  ax, 4                      ; map row (2..8 gives the points)
         mov  [flag_row], al
-.contacts:
-        mov  bx, hit_targets
-        mov  cx, TARGET_COUNT
-.next_target:
-        push bx
-        call ContactWithTarget
-        add  bx, 8                      ; next record (4 words)
-        loop .next_target
 .done:
-        pop  cx
-        pop  bx
         pop  ax
         ret
 
@@ -2002,6 +2051,10 @@ DrawMario:
         mov  bx, 2                      ; 2 = running
 .pose_set:
         mov  ax, [mario_flags]          ; AX = flags (mirror when facing left)
+        cmp  word [invuln_timer], 0
+        je   .no_blink
+        or   ax, SPR_BLINK              ; invulnerable: drawn on alternate frames
+.no_blink:
         cmp  byte [form], FORM_SUPER
         je   .super
         mov  cx, [small_poses + bx]     ; CX = address of the small sprite
@@ -2019,6 +2072,1168 @@ DrawMario:
         call DrawSprite
         pop  cx
         pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; FallEntity(ptr)
+; Purpose : gravity for any entity record that has the common layout
+;           (x at +2, y at +4, y fraction at +6, vy at +8): fall, land on solid
+;           tiles, and disappear (type/active field = 0) if it falls out of the
+;           map. Used by mushrooms and enemies.
+; Inputs  : [bp+4]=address of the record
+; Outputs : the record        Changes : none (AX, BX, CX, DX preserved)
+; ----------------------------------------------------------------------------
+FallEntity:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        mov  bx, [bp+4]
+        mov  ax, [bx+E_VY]
+        add  ax, GRAVITY
+        cmp  ax, MAX_FALL
+        jle  .fall_ok
+        mov  ax, MAX_FALL
+.fall_ok:
+        mov  [bx+E_VY], ax
+        mov  dl, al
+        sar  ax, 8
+        add  [bx+E_YF], dl              ; fractions first, then whole pixels
+        adc  [bx+E_Y], ax
+        mov  cx, [bx+E_Y]
+        add  cx, 15                     ; CX = pixel row of its feet
+        push word [bx+E_X]
+        push cx
+        call IsSolid
+        test ax, ax
+        jnz  .land
+        mov  ax, [bx+E_X]
+        add  ax, 15
+        push ax
+        push cx
+        call IsSolid
+        test ax, ax
+        jz   .no_land
+.land:
+        shr  cx, 4
+        shl  cx, 4                      ; top of the tile its feet are in
+        sub  cx, 16
+        mov  [bx+E_Y], cx               ; stand on it
+        mov  byte [bx+E_YF], 0
+        mov  word [bx+E_VY], 0
+.no_land:
+        cmp  word [bx+E_Y], PIT_Y       ; fell out of the map?
+        jl   .out
+        mov  word [bx+E_TYPE], 0        ; gone
+.out:
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; ResetEnemies
+; Purpose : fill the enemy table from enemy_start: every enemy is WAITING at
+;           its start position (they begin walking when the camera comes near)
+; Inputs  : none        Outputs : the enemy table        Changes : none
+; ----------------------------------------------------------------------------
+ResetEnemies:
+        push ax
+        push bx
+        push cx
+        push si
+        mov  si, enemy_start
+        mov  bx, enemies
+        mov  cx, ENEMY_COUNT
+.next:
+        mov  ax, [si]
+        mov  [bx+E_TYPE], ax            ; Goomba or Koopa
+        mov  ax, [si+2]
+        mov  [bx+E_X], ax               ; start x (world)
+        mov  ax, [si+4]
+        mov  [bx+E_Y], ax               ; start y
+        mov  word [bx+E_YF], 0
+        mov  word [bx+E_VY], 0
+        mov  word [bx+E_DIR], -1        ; they walk to the left, towards Mario
+        mov  word [bx+E_STATE], ST_WAIT
+        mov  word [bx+E_XF], 0
+        mov  word [bx+E_TIMER], 0
+        add  si, 6                      ; next start record (3 words)
+        add  bx, EN_REC
+        loop .next
+        pop  si
+        pop  cx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; MoveEnemyX(ptr, speed, dir)       pushed in that order
+; Purpose : move an enemy sideways by `speed` (8.8, positive) in direction
+;           dir (+1 right, -1 left). Calling it again with the opposite
+;           direction undoes the step exactly.
+; Inputs  : [bp+8]=ptr  [bp+6]=speed  [bp+4]=dir
+; Outputs : E_X, E_XF        Changes : none (AX, BX, DX preserved)
+; ----------------------------------------------------------------------------
+MoveEnemyX:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push dx
+        mov  bx, [bp+8]
+        mov  ax, [bp+6]
+        mov  dl, al                     ; DL = fraction part of the speed
+        mov  al, ah
+        xor  ah, ah                     ; AX = whole pixels of the speed
+        cmp  word [bp+4], 0
+        jl   .left
+        add  [bx+E_XF], dl              ; fractions first (may carry)
+        adc  [bx+E_X], ax
+        jmp  .out
+.left:
+        sub  [bx+E_XF], dl
+        sbb  [bx+E_X], ax
+.out:
+        pop  dx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  6
+
+; ----------------------------------------------------------------------------
+; EnemyBlocked(ptr, dir)            pushed in that order
+; Purpose : is there a solid tile at the leading edge (top and bottom of the
+;           body) of an enemy that moves in direction dir?
+; Inputs  : [bp+6]=ptr  [bp+4]=dir        Outputs : AX = 1 blocked, 0 free
+; Changes : AX only (BX, CX, DX preserved)
+; ----------------------------------------------------------------------------
+EnemyBlocked:
+        push bp
+        mov  bp, sp
+        push bx
+        push cx
+        push dx
+        mov  bx, [bp+6]
+        mov  cx, [bx+E_X]               ; CX = x of the leading edge
+        cmp  word [bp+4], 0
+        jl   .edge_ready
+        add  cx, 15                     ; moving right: right edge
+.edge_ready:
+        push cx
+        push word [bx+E_Y]              ; top of the body
+        call IsSolid
+        test ax, ax
+        jnz  .out                       ; AX = 1
+        mov  dx, [bx+E_Y]
+        add  dx, 15                     ; bottom of the body
+        push cx
+        push dx
+        call IsSolid                    ; its result is the answer
+.out:
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  bp
+        ret  4
+
+; ----------------------------------------------------------------------------
+; HitsOtherEnemy(ptr)
+; Purpose : does this enemy overlap another enemy that is walking or lying
+;           still as a shell? (Walkers turn around at other enemies.)
+; Inputs  : [bp+4]=ptr        Outputs : AX = 1 overlap, 0 none
+; Changes : AX only (BX, CX, SI preserved)
+; ----------------------------------------------------------------------------
+HitsOtherEnemy:
+        push bp
+        mov  bp, sp
+        push bx
+        push cx
+        push si
+        mov  si, [bp+4]                 ; SI = this enemy
+        mov  bx, enemies
+        mov  cx, EN_MAX
+.next:
+        cmp  bx, si
+        je   .skip                      ; not itself
+        cmp  word [bx+E_TYPE], 0
+        je   .skip
+        cmp  word [bx+E_STATE], ST_WALK
+        je   .check
+        cmp  word [bx+E_STATE], ST_SHELL
+        jne  .skip
+.check:
+        push word [si+E_X]
+        push word [si+E_Y]
+        push word 16
+        push word 16
+        push word [bx+E_X]
+        push word [bx+E_Y]
+        push word 16
+        push word 16
+        call RectOverlap
+        test ax, ax
+        jnz  .out                       ; AX = 1
+.skip:
+        add  bx, EN_REC
+        loop .next
+        xor  ax, ax
+.out:
+        pop  si
+        pop  cx
+        pop  bx
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; NoGroundAhead(ptr, dir)           pushed in that order
+; Purpose : (for Koopas) is the pixel row just below the leading foot empty?
+; Inputs  : [bp+6]=ptr  [bp+4]=dir        Outputs : AX = 1 no ground, 0 ground
+; Changes : AX only (BX, CX preserved)
+; ----------------------------------------------------------------------------
+NoGroundAhead:
+        push bp
+        mov  bp, sp
+        push bx
+        push cx
+        mov  bx, [bp+6]
+        mov  cx, [bx+E_X]
+        cmp  word [bp+4], 0
+        jl   .foot_ready
+        add  cx, 15                     ; moving right: the right foot
+.foot_ready:
+        push cx
+        mov  ax, [bx+E_Y]
+        add  ax, 16                     ; the row just under the feet
+        push ax
+        call IsSolid                    ; AX = 1 if there is ground
+        xor  ax, 1                      ; turn it around: 1 = no ground
+        pop  cx
+        pop  bx
+        pop  bp
+        ret  4
+
+; ----------------------------------------------------------------------------
+; EnemyWalk(ptr)
+; Purpose : one step of a walking Goomba / Koopa. Speed from enemy_speed.
+;           Turns around at walls and at other enemies; a Koopa also turns at
+;           the edge of a platform (a Goomba walks off and falls).
+; Inputs  : [bp+4]=ptr        Outputs : the record
+; Changes : none (AX, BX, DX, SI preserved)
+; ----------------------------------------------------------------------------
+EnemyWalk:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push dx
+        push si
+        mov  bx, [bp+4]
+        mov  si, [bx+E_TYPE]
+        shl  si, 1
+        mov  dx, [enemy_speed + si]     ; DX = speed of this kind of enemy
+        push bx
+        push dx
+        push word [bx+E_DIR]
+        call MoveEnemyX                 ; take the step
+        push bx
+        push word [bx+E_DIR]
+        call EnemyBlocked               ; wall?
+        test ax, ax
+        jnz  .turn
+        push bx
+        call HitsOtherEnemy             ; another enemy in the way?
+        test ax, ax
+        jnz  .turn
+        cmp  word [bx+E_TYPE], T_KOOPA
+        jne  .out                       ; Goombas do not care about edges
+        push bx
+        push word [bx+E_DIR]
+        call NoGroundAhead              ; Koopa: platform ends here?
+        test ax, ax
+        jz   .out
+.turn:
+        mov  ax, [bx+E_DIR]
+        neg  ax                         ; the opposite direction
+        push bx
+        push dx
+        push ax
+        call MoveEnemyX                 ; undo the step ...
+        mov  [bx+E_DIR], ax             ; ... and walk the other way from now on
+.out:
+        pop  si
+        pop  dx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; ShellKills(ptr)
+; Purpose : a sliding shell removes every other enemy it touches, +500 each
+; Inputs  : [bp+4]=ptr of the shell        Outputs : enemy table, score
+; Changes : none (AX, BX, CX, SI preserved)
+; ----------------------------------------------------------------------------
+ShellKills:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push si
+        mov  si, [bp+4]
+        mov  bx, enemies
+        mov  cx, EN_MAX
+.next:
+        cmp  bx, si
+        je   .skip
+        cmp  word [bx+E_TYPE], 0
+        je   .skip
+        cmp  word [bx+E_STATE], ST_FLAT
+        je   .skip                      ; already squashed
+        push word [si+E_X]
+        push word [si+E_Y]
+        push word 16
+        push word 16
+        push word [bx+E_X]
+        push word [bx+E_Y]
+        push word 16
+        push word 16
+        call RectOverlap
+        test ax, ax
+        jz   .skip
+        mov  word [bx+E_TYPE], 0        ; removed
+        push word 500
+        call AddScore                   ; +500 for every enemy the shell hits
+.skip:
+        add  bx, EN_REC
+        loop .next
+        pop  si
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; EnemyShellSlide(ptr)
+; Purpose : one step of a sliding shell: 3 pixels per frame, bounces off
+;           walls, counts down its kick grace time, removes other enemies
+; Inputs  : [bp+4]=ptr        Outputs : the record
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+EnemyShellSlide:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        mov  bx, [bp+4]
+        push bx
+        push word SHELL_SPEED
+        push word [bx+E_DIR]
+        call MoveEnemyX
+        push bx
+        push word [bx+E_DIR]
+        call EnemyBlocked
+        test ax, ax
+        jz   .free
+        mov  ax, [bx+E_DIR]
+        neg  ax
+        push bx
+        push word SHELL_SPEED
+        push ax
+        call MoveEnemyX                 ; undo the step ...
+        mov  [bx+E_DIR], ax             ; ... and bounce back
+.free:
+        cmp  word [bx+E_TIMER], 0
+        je   .kills
+        dec  word [bx+E_TIMER]          ; grace time after the kick
+.kills:
+        push bx
+        call ShellKills                 ; (ShellKills removes its own parameter)
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; UpdateOneEnemy(ptr)
+; Purpose : one enemy, one frame (Section 5.5):
+;           far left of the screen -> removed
+;           WAITING  stands still until it is within one tile of the screen
+;           WALKING  EnemyWalk       SLIDING  EnemyShellSlide
+;           FLAT     counts its 1 second, then disappears
+;           SHELL    only its grace timer counts down
+;           then gravity (FallEntity) for everybody except WAITING
+; Inputs  : [bp+4]=ptr        Outputs : the record
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+UpdateOneEnemy:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        mov  bx, [bp+4]
+        cmp  word [bx+E_TYPE], 0
+        jne  .exists
+        jmp  .out
+.exists:
+        mov  ax, [bx+E_X]
+        sub  ax, [camera_x]             ; screen x
+        cmp  ax, -CULL_LEFT
+        jge  .near
+        mov  word [bx+E_TYPE], 0        ; left behind: removed
+        jmp  .out
+.near:
+        cmp  word [bx+E_STATE], ST_WAIT
+        jne  .acting
+        cmp  ax, SCREEN_W + ACTIVATE_MARGIN
+        jl   .wake_up
+        jmp  .out                       ; still far away on the right
+.wake_up:
+        mov  word [bx+E_STATE], ST_WALK ; within one tile of the screen: go!
+.acting:
+        mov  ax, [bx+E_STATE]
+        cmp  ax, ST_FLAT
+        je   .flat
+        cmp  ax, ST_WALK
+        jne  .not_walk
+        push bx
+        call EnemyWalk
+        jmp  .fall
+.not_walk:
+        cmp  ax, ST_SLIDE
+        jne  .still_shell
+        push bx
+        call EnemyShellSlide
+        jmp  .fall
+.still_shell:
+        cmp  word [bx+E_TIMER], 0
+        je   .fall
+        dec  word [bx+E_TIMER]          ; stationary shell: grace time
+        jmp  .fall
+.flat:
+        dec  word [bx+E_TIMER]
+        jnz  .fall
+        mov  word [bx+E_TYPE], 0        ; flat for one second, now gone
+        jmp  .out
+.fall:
+        push bx
+        call FallEntity
+.out:
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; UpdateEnemies
+; Purpose : step 4 of the frame order for enemies and shells
+; Inputs  : none        Outputs : the enemy table        Changes : none
+; ----------------------------------------------------------------------------
+UpdateEnemies:
+        push bx
+        push cx
+        mov  bx, enemies
+        mov  cx, EN_MAX
+.next:
+        push bx
+        call UpdateOneEnemy
+        add  bx, EN_REC
+        loop .next
+        pop  cx
+        pop  bx
+        ret
+
+; ----------------------------------------------------------------------------
+; AddStompPoints
+; Purpose : points for a stomp from the chain table (stomps in one jump):
+;           100 200 400 500 800 1000 2000 4000 5000 8000, then a 1-UP.
+;           Counts the stomp (the counter resets when Mario lands).
+; Inputs  : stomp_chain        Outputs : score / lives, stomp_chain
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+AddStompPoints:
+        push ax
+        push bx
+        xor  ax, ax
+        mov  al, [stomp_chain]
+        cmp  al, 10
+        jae  .one_up                    ; 11th stomp and more
+        shl  ax, 1                      ; word table: index * 2
+        mov  bx, ax
+        push word [chain_points + bx]
+        call AddScore
+        jmp  .count
+.one_up:
+        call AddLife
+.count:
+        cmp  byte [stomp_chain], 200
+        jae  .out
+        inc  byte [stomp_chain]
+.out:
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; HeroDies
+; Purpose : Mario dies (enemy, pit or clock). PLACEHOLDER until Module 15:
+;           the level simply restarts. One procedure so there is one place to
+;           change when the death sequence is added.
+; Inputs  : none        Outputs : the level is reset        Changes : none
+; ----------------------------------------------------------------------------
+HeroDies:
+        call ResetLevel
+        ret
+
+; ----------------------------------------------------------------------------
+; HurtMario
+; Purpose : an enemy touched Mario without being stomped (Section 5.7):
+;           invulnerable  -> nothing
+;           Super Mario   -> becomes Small (HP 1, feet stay fixed), 2 seconds
+;                            of invulnerability
+;           Small Mario   -> dies
+; Inputs  : none        Outputs : form, hp, mario_y, invuln_timer
+; Changes : none
+; ----------------------------------------------------------------------------
+HurtMario:
+        cmp  word [invuln_timer], 0
+        jne  .out                       ; blinking: enemies cannot hurt him
+        mov  byte [hurt_timer], 12      ; (test lamp)
+        cmp  byte [form], FORM_SUPER
+        jne  .dies
+        mov  byte [form], FORM_SMALL    ; HUD hearts change at once
+        mov  byte [hp], 1
+        add  word [mario_y], HERO_H_SUPER - HERO_H_SMALL   ; feet fixed: top 16 lower
+        mov  word [invuln_timer], INVULN_FRAMES
+        jmp  .out
+.dies:
+        call HeroDies
+.out:
+        ret
+
+; ----------------------------------------------------------------------------
+; StompEnemy(ptr)
+; Purpose : Mario landed on an enemy from above:
+;           chain points, Mario bounces (higher if Space is held), chain + 1.
+;           Goomba -> flat for 1 s.  Koopa or sliding shell -> stationary shell.
+; Inputs  : [bp+4]=ptr        Outputs : enemy record, score, mario_vy
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+StompEnemy:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        mov  bx, [bp+4]
+        call AddStompPoints
+        mov  ax, STOMP_BOUNCE
+        cmp  byte [key_table + SC_SPACE], 0
+        je   .bounce_set
+        mov  ax, STOMP_BOUNCE_HIGH      ; jump key held = higher bounce
+.bounce_set:
+        mov  [mario_vy], ax
+        mov  byte [stomp_timer], 12     ; (test lamp)
+        cmp  word [bx+E_STATE], ST_SLIDE
+        je   .to_shell
+        cmp  word [bx+E_TYPE], T_KOOPA
+        je   .to_shell
+        mov  word [bx+E_STATE], ST_FLAT         ; Goomba: flattened
+        mov  word [bx+E_TIMER], FLAT_FRAMES
+        jmp  .out
+.to_shell:
+        mov  word [bx+E_STATE], ST_SHELL        ; stationary shell
+        mov  word [bx+E_TIMER], SHELL_GRACE     ; ignores Mario for a moment
+.out:
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; KickShell(ptr)
+; Purpose : Mario touched (or stomped) a stationary shell: +400, it slides
+;           away from him, and for 8 frames it ignores him (so the kick cannot
+;           hurt him)
+; Inputs  : [bp+4]=ptr        Outputs : enemy record, score
+; Changes : none (AX, BX, DX preserved)
+; ----------------------------------------------------------------------------
+KickShell:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push dx
+        mov  bx, [bp+4]
+        push word 400
+        call AddScore
+        mov  word [bx+E_STATE], ST_SLIDE
+        mov  word [bx+E_TIMER], KICK_GRACE
+        mov  ax, [mario_x]
+        add  ax, HB_OFF + HB_W / 2      ; centre of Mario
+        mov  dx, [bx+E_X]
+        add  dx, 8                      ; centre of the shell
+        mov  word [bx+E_DIR], 1         ; Mario on the left: it slides right
+        cmp  ax, dx
+        jl   .done
+        mov  word [bx+E_DIR], -1        ; Mario on the right: it slides left
+.done:
+        pop  dx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; ContactEnemy(ptr)
+; Purpose : Mario against ONE enemy (Section 5.6 outcomes):
+;           no overlap / waiting / flat      nothing
+;           stationary shell                 kick (+400), never hurts
+;           walking or sliding               stomp -> StompEnemy, otherwise
+;                                            HurtMario (does nothing while
+;                                            invulnerable; a stomp always works)
+;           a shell in its grace time is ignored
+; Inputs  : [bp+4]=ptr        Outputs : many
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+ContactEnemy:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        mov  bx, [bp+4]
+        cmp  word [bx+E_TYPE], 0
+        je   .out
+        mov  ax, [bx+E_STATE]
+        cmp  ax, ST_WALK
+        je   .candidate
+        cmp  ax, ST_SHELL
+        je   .candidate
+        cmp  ax, ST_SLIDE
+        jne  .out                       ; waiting or flat: harmless
+.candidate:
+        cmp  word [bx+E_TIMER], 0
+        jne  .out                       ; grace time: ignores Mario
+        mov  ax, [mario_x]
+        add  ax, HB_OFF
+        push ax                         ; Mario's hitbox: x
+        push word [mario_y]             ;                 y
+        push word HB_W                  ;                 w
+        call HeroHeight
+        push ax                         ;                 h
+        push word [bx+E_X]              ; enemy 16 x 16
+        push word [bx+E_Y]
+        push word 16
+        push word 16
+        call RectOverlap
+        test ax, ax
+        jz   .out
+        cmp  word [bx+E_STATE], ST_SHELL
+        je   .kick
+        push word [prev_feet_y]         ; stomp or hurt?
+        push word [bx+E_Y]
+        push word 16
+        call ClassifyContact
+        test ax, ax
+        jz   .hurt
+        push bx
+        call StompEnemy
+        jmp  .out
+.kick:
+        push bx
+        call KickShell
+        jmp  .out
+.hurt:
+        call HurtMario
+.out:
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; CheckEnemies
+; Purpose : step 5 of the frame order: Mario against every enemy
+; Inputs  : none        Outputs : many        Changes : none (BX, CX preserved)
+; ----------------------------------------------------------------------------
+CheckEnemies:
+        push bx
+        push cx
+        mov  bx, enemies
+        mov  cx, EN_MAX
+.next:
+        push bx
+        call ContactEnemy
+        add  bx, EN_REC
+        loop .next
+        pop  cx
+        pop  bx
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawOneEnemy(ptr)
+; Purpose : draw one enemy if it is on the screen:
+;           Goomba (flat sprite when squashed), Koopa (shell sprite when it is
+;           a shell). They face the way they walk.
+; Inputs  : [bp+4]=ptr        Outputs : none
+; Changes : none (AX, BX, CX, DX preserved)
+; ----------------------------------------------------------------------------
+DrawOneEnemy:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        mov  bx, [bp+4]
+        cmp  word [bx+E_TYPE], 0
+        je   .out
+        mov  ax, [bx+E_X]
+        sub  ax, [camera_x]             ; world x -> screen x
+        cmp  ax, -SPRITE_W
+        jle  .out
+        cmp  ax, SCREEN_W
+        jge  .out
+        mov  cx, spr_goomba
+        cmp  word [bx+E_TYPE], T_KOOPA
+        je   .koopa
+        cmp  word [bx+E_STATE], ST_FLAT
+        jne  .flags
+        mov  cx, spr_goomba_flat
+        jmp  .flags
+.koopa:
+        mov  cx, spr_koopa
+        cmp  word [bx+E_STATE], ST_SHELL
+        je   .shell
+        cmp  word [bx+E_STATE], ST_SLIDE
+        jne  .flags
+.shell:
+        mov  cx, spr_shell
+.flags:
+        xor  dx, dx
+        cmp  word [bx+E_DIR], 0
+        jle  .draw
+        mov  dx, SPR_MIRROR             ; walking right: flip the picture
+.draw:
+        push ax                         ; x on screen
+        push word [bx+E_Y]
+        push cx                         ; sprite
+        push dx                         ; flags
+        call DrawSprite
+.out:
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; DrawEnemies
+; Purpose : draw every enemy
+; Inputs  : none        Outputs : none        Changes : none (BX, CX preserved)
+; ----------------------------------------------------------------------------
+DrawEnemies:
+        push bx
+        push cx
+        mov  bx, enemies
+        mov  cx, EN_MAX
+.next:
+        push bx
+        call DrawOneEnemy
+        add  bx, EN_REC
+        loop .next
+        pop  cx
+        pop  bx
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawChar(x, y, ch, colour)        pushed in that order
+; Purpose : draw one 5 x 7 character from font_data (screen position of its
+;           top-left pixel). Digits, letters (lower case is shown as upper
+;           case), '-' ; anything else is a blank. A character that would not
+;           fit completely on the screen is not drawn.
+; Inputs  : [bp+10]=x  [bp+8]=y  [bp+6]=character code  [bp+4]=colour
+; Outputs : none
+; Changes : none (all registers preserved)
+; ----------------------------------------------------------------------------
+DrawChar:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        push es
+        cmp  word [bp+10], SCREEN_W - FONT_W   ; unsigned: also rejects x < 0
+        ja   .out
+        cmp  word [bp+8], SCREEN_H - FONT_H    ; and y < 0
+        ja   .out
+        mov  ax, [bp+6]                 ; AX = character code
+        cmp  al, '-'
+        je   .dash
+        cmp  al, 'a'
+        jb   .upper_ok
+        cmp  al, 'z'
+        ja   .upper_ok
+        sub  al, 32                     ; 'a'..'z' -> 'A'..'Z'
+.upper_ok:
+        cmp  al, '0'
+        jb   .blank
+        cmp  al, '9'
+        jbe  .digit
+        cmp  al, 'A'
+        jb   .blank
+        cmp  al, 'Z'
+        ja   .blank
+        sub  al, 'A' - 10               ; 'A' -> glyph 10
+        jmp  .have_index
+.digit:
+        sub  al, '0'                    ; '5' -> glyph 5
+        jmp  .have_index
+.dash:
+        mov  al, GLYPH_DASH
+        jmp  .have_index
+.blank:
+        mov  al, GLYPH_BLANK
+.have_index:
+        xor  ah, ah
+        mov  si, ax
+        shl  si, 3
+        sub  si, ax                     ; SI = index * 7
+        add  si, font_data              ; SI = first row of this glyph
+        mov  es, [draw_seg]
+        mov  ax, [bp+8]
+        mov  di, ax
+        shl  di, 8                      ; y * 256
+        shl  ax, 6                      ; y * 64
+        add  di, ax                     ; y * 320
+        add  di, [bp+10]                ; + x = DI = first pixel
+        mov  dl, [bp+4]                 ; DL = colour
+        mov  cx, FONT_H                 ; 7 rows
+        cld
+.row:
+        lodsb                           ; AL = the 5 pixels of this row
+        shl  al, 3                      ; leftmost pixel (bit 4) -> bit 7
+        mov  bx, di                     ; BX = where this row starts
+        mov  ah, FONT_W                 ; 5 pixels
+.pixel:
+        shl  al, 1                      ; carry = this pixel
+        jnc  .skip
+        mov  [es:bx], dl                ; draw it
+.skip:
+        inc  bx
+        dec  ah
+        jnz  .pixel
+        add  di, SCREEN_W               ; next row
+        loop .row
+.out:
+        pop  es
+        pop  di
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  8
+
+; ----------------------------------------------------------------------------
+; DrawText(x, y, address, colour)   pushed in that order
+; Purpose : draw a string that ends with a 0 byte; 6 pixels per character
+; Inputs  : [bp+10]=x  [bp+8]=y  [bp+6]=address of the text  [bp+4]=colour
+; Outputs : none        Changes : none (AX, DX, SI preserved)
+; ----------------------------------------------------------------------------
+DrawText:
+        push bp
+        mov  bp, sp
+        push ax
+        push dx
+        push si
+        mov  si, [bp+6]                 ; SI = the next character
+        mov  dx, [bp+10]                ; DX = x of the next character
+.next:
+        mov  al, [si]
+        test al, al
+        jz   .done                      ; 0 = end of the text
+        xor  ah, ah
+        push dx                         ; x
+        push word [bp+8]                ; y
+        push ax                         ; character
+        push word [bp+4]                ; colour
+        call DrawChar
+        add  dx, CHAR_ADV               ; 5 pixels + 1 gap
+        inc  si
+        jmp  .next
+.done:
+        pop  si
+        pop  dx
+        pop  ax
+        pop  bp
+        ret  8
+
+; ----------------------------------------------------------------------------
+; DrawNumber(x, y, hi, lo, digits, colour)   pushed in that order
+; Purpose : write a 32-bit number (hi:lo) as `digits` decimal digits,
+;           zero-padded. Decimal conversion exactly as the manual asks:
+;           repeated division by 10, each remainder is PUSHED, then the digits
+;           are POPPED in reverse order (the last remainder is the first digit).
+; Inputs  : [bp+14]=x [bp+12]=y [bp+10]=hi [bp+8]=lo [bp+6]=digits [bp+4]=colour
+; Outputs : none        Changes : none (all registers preserved)
+; ----------------------------------------------------------------------------
+DrawNumber:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        mov  cx, [bp+6]                 ; CX = how many digits
+        test cx, cx
+        jz   .done
+        mov  si, [bp+10]                ; SI:DI = the 32-bit number
+        mov  di, [bp+8]
+        mov  bx, 10
+.divide:
+        mov  ax, si                     ; 32-bit / 10 in two 16-bit steps:
+        xor  dx, dx
+        div  bx                         ; high word / 10 -> AX, remainder DX
+        mov  si, ax
+        mov  ax, di
+        div  bx                         ; (remainder:low word) / 10
+        mov  di, ax                     ; DX = remainder of the whole number
+        push dx                         ; one digit, least significant first
+        loop .divide
+        mov  cx, [bp+6]
+        mov  si, [bp+14]                ; SI = x of the next digit
+.show:
+        pop  dx                         ; digits come back most significant first
+        add  dx, '0'                    ; 0..9 -> '0'..'9'
+        push si                         ; x
+        push word [bp+12]               ; y
+        push dx                         ; character
+        push word [bp+4]                ; colour
+        call DrawChar
+        add  si, CHAR_ADV
+        loop .show
+.done:
+        pop  di
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  12
+
+; ----------------------------------------------------------------------------
+; DrawHeart(x, y, filled)           pushed in that order
+; Purpose : the 7 x 6 heart icon: red when filled, dark when empty
+; Inputs  : [bp+8]=x  [bp+6]=y  [bp+4]=filled (0 = empty)
+; Outputs : none        Changes : none (all registers preserved)
+; ----------------------------------------------------------------------------
+DrawHeart:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push di
+        push es
+        mov  es, [draw_seg]
+        mov  dl, COL_OUTLINE            ; empty heart
+        cmp  word [bp+4], 0
+        je   .colour_ok
+        mov  dl, COL_HERO               ; filled heart
+.colour_ok:
+        mov  ax, [bp+6]
+        mov  di, ax
+        shl  di, 8
+        shl  ax, 6
+        add  di, ax
+        add  di, [bp+8]                 ; DI = first pixel
+        mov  si, heart_data
+        mov  cx, HEART_H
+        cld
+.row:
+        lodsb
+        shl  al, 1                      ; leftmost of the 7 pixels (bit 6) -> bit 7
+        mov  bx, di
+        mov  ah, 7
+.pixel:
+        shl  al, 1
+        jnc  .skip
+        mov  [es:bx], dl
+.skip:
+        inc  bx
+        dec  ah
+        jnz  .pixel
+        add  di, SCREEN_W
+        loop .row
+        pop  es
+        pop  di
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  6
+
+; ----------------------------------------------------------------------------
+; DrawHUD
+; Purpose : the heads-up display in the top 16-pixel strip (Section 5.14),
+;           redrawn every frame:
+;           SCORE (6 digits)  COINS (x + 2)  WORLD 1-1  TIME (3)  LIVES (x + 2)
+;           and two hearts for health (HP 1 = one filled, HP 2 = two filled)
+; Inputs  : score, coins, time_left, lives, hp        Outputs : none
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawHUD:
+        push ax
+        push word 0                     ; the dark strip behind everything
+        push word 0
+        push word SCREEN_W
+        push word HUD_H
+        push word COL_HUD
+        call FillRect
+
+        push word 8                     ; ---- SCORE ----
+        push word 1
+        push word str_score
+        push word COL_COIN
+        call DrawText
+        push word 8
+        push word 9
+        push word [score_hi]
+        push word [score_lo]
+        push word 6
+        push word COL_TEXT
+        call DrawNumber
+
+        push word 72                    ; ---- COINS: x 00 ----
+        push word 1
+        push word str_coins
+        push word COL_COIN
+        call DrawText
+        push word 72
+        push word 9
+        push word 'X'
+        push word COL_TEXT
+        call DrawChar
+        xor  ax, ax
+        mov  al, [coins]
+        push word 78
+        push word 9
+        push word 0
+        push ax
+        push word 2
+        push word COL_TEXT
+        call DrawNumber
+
+        push word 120                   ; ---- WORLD 1-1 ----
+        push word 1
+        push word str_world
+        push word COL_COIN
+        call DrawText
+        push word 120
+        push word 9
+        push word str_world_val
+        push word COL_TEXT
+        call DrawText
+
+        push word 176                   ; ---- TIME ----
+        push word 1
+        push word str_time
+        push word COL_COIN
+        call DrawText
+        push word 176
+        push word 9
+        push word 0
+        push word [time_left]
+        push word 3
+        push word COL_TEXT
+        call DrawNumber
+
+        push word 224                   ; ---- LIVES: x 00 ----
+        push word 1
+        push word str_lives
+        push word COL_COIN
+        call DrawText
+        push word 224
+        push word 9
+        push word 'X'
+        push word COL_TEXT
+        call DrawChar
+        xor  ax, ax
+        mov  al, [lives]
+        push word 230
+        push word 9
+        push word 0
+        push ax
+        push word 2
+        push word COL_TEXT
+        call DrawNumber
+
+        push word 272                   ; ---- HEALTH: two hearts ----
+        push word 1
+        push word str_hp
+        push word COL_COIN
+        call DrawText
+        push word 272                   ; heart 1: always filled (HP is 1 or 2)
+        push word 8
+        push word 1
+        call DrawHeart
+        xor  ax, ax
+        cmp  byte [hp], 2
+        jb   .second_heart
+        inc  ax                         ; HP 2: the second heart is filled too
+.second_heart:
+        push word 283
+        push word 8
+        push ax
+        call DrawHeart
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; HandleDebugKeys
+; Purpose : debug keys (listed in the README, as the manual allows):
+;           T = set the clock to 5 seconds   C = set coins to 99
+;           D = show / hide the test overlay (lamps, mini-map, bars)
+; Inputs  : key_table        Outputs : time_left, coins, debug_on
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+HandleDebugKeys:
+        push ax
+        cmp  byte [key_table + SC_T], 0
+        je   .no_t
+        mov  word [time_left], 5
+.no_t:
+        cmp  byte [key_table + SC_C], 0
+        je   .no_c
+        mov  byte [coins], 99
+.no_c:
+        mov  al, [key_table + SC_D]
+        test al, al
+        jz   .remember
+        cmp  byte [d_was_down], 0
+        jne  .remember                  ; still held: toggle only once per press
+        xor  byte [debug_on], 1
+.remember:
+        mov  [d_was_down], al
         pop  ax
         ret
 
@@ -2383,39 +3598,6 @@ DrawSprite:
         mov  sp, bp                     ; drop the locals
         pop  bp
         ret  8
-
-; ----------------------------------------------------------------------------
-; DrawWorldItems
-; Purpose : draw every object of world_items that is on the screen:
-;           screen_x = world_x - camera_x, drawn only if -16 < screen_x < 320
-; Inputs  : none        Outputs : none
-; Changes : none (AX, BX, CX preserved)
-; ----------------------------------------------------------------------------
-DrawWorldItems:
-        push ax
-        push bx
-        push cx
-        mov  bx, world_items            ; BX walks the table
-        mov  cx, ITEM_COUNT
-.next:
-        mov  ax, [bx]                   ; world x
-        sub  ax, [camera_x]             ; AX = screen x (may be negative)
-        cmp  ax, -SPRITE_W
-        jle  .skip                      ; completely off the left side
-        cmp  ax, SCREEN_W
-        jge  .skip                      ; completely off the right side
-        push ax                         ; x on screen
-        push word [bx+2]                ; y
-        push word [bx+4]                ; sprite address
-        push word [bx+6]                ; flags
-        call DrawSprite
-.skip:
-        add  bx, 8                      ; next object (4 words)
-        loop .next
-        pop  cx
-        pop  bx
-        pop  ax
-        ret
 
 ; ----------------------------------------------------------------------------
 ; SetPalette
