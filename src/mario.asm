@@ -1,16 +1,11 @@
 ; ============================================================================
-;  MARIO.ASM  -  Super Mario Engine, DAY 11 reference build
-;  Modules covered: 2-8, 9 (physics), 10 (collision), 12 (blocks, items),
-;                   13 (score, HUD), 11 (enemies and shells)
+;  
+;  Modules: 1-13 plus 14 (game states, screens, menus) and
+;           15 (death, win, restart, clean exit)
 ;  Build:  nasm -f bin mario.asm -o MARIO.COM
-;  Test :  Six enemies (4 Goombas, 2 Koopas) walk towards Mario once the
-;          camera comes near. Stomp them (jump on top), kick shells, hit them
-;          with a sliding shell (+500 each). Side contact hurts: Super Mario
-;          becomes Small and blinks for 2 s, Small Mario dies (level restarts
-;          until Module 15 adds the real death sequence).
-;          Debug keys: T clock to 5 s   C coins to 99   D test overlay
-;          Left/Right = move, Shift = run, Space = jump,
-;          Enter = new game, Esc = quit (through Shutdown).
+;  Keys  : Up/Down = menu, Enter = select / continue, Left/Right = move,
+;          Left Shift = run, Space = jump, P = pause, Esc = title / exit
+;  Debug : T clock to 5 s   C coins to 99   D test overlay (listed in README)
 ; ============================================================================
         cpu 186                         ; allows OUTSB and PUSH imm
         bits 16
@@ -44,6 +39,25 @@ JUMP_START      equ 0FA80h              ; -5.5 (two's complement)
 JUMP_CUT        equ 0FE00h              ; -2.0 space released while rising
 MAX_FALL        equ 0400h               ; 4.0
 MARIO_START_Y   equ 144                 ; top of Mario standing on row 9 (row 9 * 16)
+STATE_TITLE     equ 0                   ; game states (index into state_table)
+STATE_PLAYING   equ 1
+STATE_PAUSED    equ 2
+STATE_DYING     equ 3
+STATE_LIFE_LOST equ 4
+STATE_WIN       equ 5                   ; the win sequence (slide down the pole)
+STATE_COMPLETE  equ 6                   ; the LEVEL COMPLETE screen
+STATE_GAME_OVER equ 7
+STATE_EXIT      equ 8
+DEATH_HOP       equ 0FB20h              ; -4.875: rises about 48 pixels
+DEATH_FRAMES    equ 50                  ; death animation, about 1.5 seconds
+LIFE_LOST_FRAMES equ 60                 ; Life-lost screen, about 2 seconds
+WIN_SLIDE_SPEED equ 3                   ; pixels per frame down the pole
+WIN_HIDE_FRAMES equ 30                  ; about 1 second into the castle
+POLE_X          equ 868                 ; where Mario hangs on the flag pole
+BASE_TOP_Y      equ 144                 ; top of the pole's base block (row 9)
+BIG_ADV         equ 12                  ; big characters: 10 pixels + 2 gap
+GLYPH_EQUALS    equ 38
+
 EN_MAX          equ 8                   ; enemy slots (at most 8 active at once)
 EN_REC          equ 18                  ; bytes per enemy record (9 words)
 E_TYPE          equ 0                   ; 0 = free, 1 = Goomba, 2 = Koopa
@@ -189,6 +203,43 @@ hurt_timer      db 0            ; frames the "hurt" lamp stays lit
 flag_touched    db 0            ; 1 once the flag pole was touched
 flag_row        db 0            ; map row of his feet at that moment (2..8)
 
+game_state      dw STATE_TITLE  ; which state the game is in
+menu_sel        db 0            ; title menu: 0 = START GAME, 1 = EXIT
+dying_timer     dw 0            ; frames of the death animation so far
+screen_timer    dw 0            ; frames of the Life-lost screen so far
+win_phase       db 0            ; 0 = sliding down the pole, 1 = into the castle
+win_timer       dw 0
+win_bonus       dw 0            ; time left x 50 (shown on LEVEL COMPLETE)
+mario_hidden    db 0            ; 1 = do not draw Mario (win sequence)
+prev_keys       times 128 db 0  ; key table of the previous frame (press detection)
+
+; the jump table: one procedure per state, indexed by game_state * 2
+state_table     dw StateTitle, StatePlaying, StatePaused, StateDying
+                dw StateLifeLost, StateWin, StateComplete, StateGameOver
+                dw StateExit
+
+; flag pole points by the map row of Mario's feet: rows 2,3,4,5,6,7,8
+flag_points     dw 5000, 5000, 2000, 800, 400, 400, 100
+
+; texts of the screens (end with 0)
+str_title1      db 'SUPER MARIO', 0
+str_title2      db 'ENGINE', 0
+str_start       db 'START GAME', 0
+str_exit        db 'EXIT', 0
+str_hint        db 'UP DOWN ENTER', 0
+str_team1       db 'COAL SEMESTER PROJECT', 0
+str_team2       db 'BY YOUR TEAM NAMES HERE', 0
+str_paused      db 'PAUSED', 0
+str_pause_help  db 'P RESUME  ESC TITLE', 0
+str_lifeworld   db 'WORLD 1-1', 0
+str_lives_left  db 'LIVES LEFT', 0
+str_complete    db 'LEVEL COMPLETE', 0
+str_timeleft    db 'TIME LEFT', 0
+str_times50     db 'X 50 =', 0
+str_press_enter db 'PRESS ENTER', 0
+str_gameover    db 'GAME OVER', 0
+str_final       db 'FINAL SCORE', 0
+
 time_left       dw START_TIME   ; the level clock, counts down 300 -> 0
 debug_on        db 0            ; 1 = test overlay visible
 d_was_down      db 0            ; D key state last frame (toggle once per press)
@@ -277,6 +328,7 @@ font_data:
         ; ---- punctuation ----
         db 00000b, 00000b, 00000b, 11111b, 00000b, 00000b, 00000b   ; -
         db 00000b, 00000b, 00000b, 00000b, 00000b, 00000b, 00000b   ; (blank)
+        db 00000b, 00000b, 11111b, 00000b, 11111b, 00000b, 00000b   ; =
 
 ; the heart icon: 7 pixels wide, 6 rows (bit 6 = leftmost pixel)
 HEART_H         equ 6
@@ -677,42 +729,22 @@ main:
         call DecodeSprites
         call ResetMap
         call InstallHandlers            ; keyboard + timer are ours from here on
-        call NewGame                    ; score 0, 3 lives, level, Mario
+        mov  word [game_state], STATE_TITLE
 
 .frame:
         call WaitTick                   ; 1. wait for the next timer tick
-        call UpdateClock                ; 6. count real seconds
-        call UpdateMario                ; 2-3. read the key table, move Mario
-        call UpdateEnemies              ; 4. enemies and shells
-        call UpdateMushrooms            ;    mushrooms walk and fall
-        call UpdatePops                 ;    coin pop-ups rise
-        call CheckHazards               ; 7. pit, clock, flag pole
-        call CheckEnemies               ; 5. stomp, kick, hurt
-        call CollectItems               ; 5. coin tiles, mushrooms
-        call UpdateCamera               ; 8. follow Mario (Section 5.3)
-        call ClearBuffer                ; 9. wipe last frame
-        call DrawMap                    ;    tiles, shifted by the camera
-        call DrawEnemies
-        call DrawMushrooms
-        call DrawPops
-        call DrawMario
-        call DrawHUD                    ;    the heads-up display (always on top)
-        cmp  byte [debug_on], 0
-        je   .no_overlay
-        call DrawMinimap                ;    test aids (key D)
-        call DrawPhysicsBars
-        call DrawStatusBars
-.no_overlay:
+        cmp  word [game_state], STATE_PLAYING
+        je   .dispatch
+        mov  ax, [tick_count]           ; the clock is frozen outside PLAYING:
+        mov  [last_tick], ax            ; do not let these ticks count later
+.dispatch:
+        mov  bx, [game_state]
+        shl  bx, 1
+        call word [state_table + bx]    ; the jump table: one handler per state
         call CopyBuffer                 ; 10. ONE copy to the screen per frame
         inc  word [frame_counter]
-        call HandleDebugKeys
-        cmp  byte [key_table + SC_ENTER], 0
-        je   .no_restart
-        call NewGame                    ; Enter: a completely new game
-.no_restart:
-        cmp  byte [key_table + SC_ESC], 0
-        je   .frame
-        jmp  Shutdown                   ; the ONLY way out of the game
+        call SavePrevKeys               ; for the "pressed this frame" tests
+        jmp  .frame
 
 
 ; ----------------------------------------------------------------------------
@@ -1959,7 +1991,7 @@ CheckHazards:
 .time_ok:
         cmp  word [mario_y], PIT_Y      ; SIGNED: fell below the map?
         jl   .no_pit
-        call HeroDies
+        call HeroFalls                  ; a pit: no hop, he just keeps falling
         jmp  .done
 .no_pit:
         cmp  byte [flag_touched], 0
@@ -2582,14 +2614,19 @@ AddStompPoints:
         ret
 
 ; ----------------------------------------------------------------------------
-; HeroDies
-; Purpose : Mario dies (enemy, pit or clock). PLACEHOLDER until Module 15:
-;           the level simply restarts. One procedure so there is one place to
-;           change when the death sequence is added.
-; Inputs  : none        Outputs : the level is reset        Changes : none
+; HeroDies / HeroFalls
+; Purpose : the two ways to die. HeroDies = enemy or clock: hop up about 48
+;           pixels, then fall. HeroFalls = pit: no hop, he just keeps falling.
+; Inputs  : none        Outputs : the DYING state        Changes : none
 ; ----------------------------------------------------------------------------
 HeroDies:
-        call ResetLevel
+        push word DEATH_HOP
+        call StartDying
+        ret
+
+HeroFalls:
+        push word 0
+        call StartDying
         ret
 
 ; ----------------------------------------------------------------------------
@@ -2877,39 +2914,9 @@ DrawChar:
         ja   .out
         cmp  word [bp+8], SCREEN_H - FONT_H    ; and y < 0
         ja   .out
-        mov  ax, [bp+6]                 ; AX = character code
-        cmp  al, '-'
-        je   .dash
-        cmp  al, 'a'
-        jb   .upper_ok
-        cmp  al, 'z'
-        ja   .upper_ok
-        sub  al, 32                     ; 'a'..'z' -> 'A'..'Z'
-.upper_ok:
-        cmp  al, '0'
-        jb   .blank
-        cmp  al, '9'
-        jbe  .digit
-        cmp  al, 'A'
-        jb   .blank
-        cmp  al, 'Z'
-        ja   .blank
-        sub  al, 'A' - 10               ; 'A' -> glyph 10
-        jmp  .have_index
-.digit:
-        sub  al, '0'                    ; '5' -> glyph 5
-        jmp  .have_index
-.dash:
-        mov  al, GLYPH_DASH
-        jmp  .have_index
-.blank:
-        mov  al, GLYPH_BLANK
-.have_index:
-        xor  ah, ah
+        push word [bp+6]
+        call GlyphPtr                   ; AX = address of this character's rows
         mov  si, ax
-        shl  si, 3
-        sub  si, ax                     ; SI = index * 7
-        add  si, font_data              ; SI = first row of this glyph
         mov  es, [draw_seg]
         mov  ax, [bp+8]
         mov  di, ax
@@ -3913,4 +3920,965 @@ ResetHero:
         mov  byte [hurt_timer], 0
         mov  byte [flag_touched], 0
         mov  byte [flag_row], 0
+        mov  byte [mario_hidden], 0
         ret
+
+; ----------------------------------------------------------------------------
+; GlyphPtr(ch)
+; Purpose : address of the 7 font bytes of a character. Digits, letters (lower
+;           case counts as upper case), '-' and '='; anything else is blank.
+; Inputs  : [bp+4]=character code        Outputs : AX = address in font_data
+; Changes : AX only
+; ----------------------------------------------------------------------------
+GlyphPtr:
+        push bp
+        mov  bp, sp
+        push bx
+        mov  ax, [bp+4]
+        cmp  al, '-'
+        je   .dash
+        cmp  al, '='
+        je   .equals
+        cmp  al, 'a'
+        jb   .upper_ok
+        cmp  al, 'z'
+        ja   .upper_ok
+        sub  al, 32                     ; 'a'..'z' -> 'A'..'Z'
+.upper_ok:
+        cmp  al, '0'
+        jb   .blank
+        cmp  al, '9'
+        jbe  .digit
+        cmp  al, 'A'
+        jb   .blank
+        cmp  al, 'Z'
+        ja   .blank
+        sub  al, 'A' - 10               ; 'A' -> glyph 10
+        jmp  .have_index
+.digit:
+        sub  al, '0'                    ; '5' -> glyph 5
+        jmp  .have_index
+.dash:
+        mov  al, GLYPH_DASH
+        jmp  .have_index
+.equals:
+        mov  al, GLYPH_EQUALS
+        jmp  .have_index
+.blank:
+        mov  al, GLYPH_BLANK
+.have_index:
+        xor  ah, ah
+        mov  bx, ax
+        shl  ax, 3
+        sub  ax, bx                     ; index * 7
+        add  ax, font_data              ; address of this glyph's first row
+        pop  bx
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; DrawCharBig(x, y, ch, colour)     pushed in that order
+; Purpose : a character twice as big (10 x 14): every font pixel becomes a
+;           2 x 2 square. Used for titles. (Clipped by FillRect.)
+; Inputs  : [bp+10]=x  [bp+8]=y  [bp+6]=character  [bp+4]=colour
+; Outputs : none        Changes : none (all registers preserved)
+; ----------------------------------------------------------------------------
+DrawCharBig:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        push word [bp+6]
+        call GlyphPtr
+        mov  si, ax                     ; SI = glyph rows
+        mov  dx, [bp+8]                 ; DX = y of the current row
+        mov  cx, FONT_H
+        cld
+.row:
+        lodsb
+        shl  al, 3                      ; leftmost pixel -> bit 7
+        mov  bx, [bp+10]                ; BX = x of the current pixel
+        mov  ah, FONT_W
+.pixel:
+        shl  al, 1                      ; carry = this pixel
+        jnc  .skip
+        push bx
+        push dx
+        push word 2
+        push word 2
+        push word [bp+4]
+        call FillRect                   ; FillRect keeps AX, BX, CX, DX safe
+.skip:
+        add  bx, 2
+        dec  ah
+        jnz  .pixel
+        add  dx, 2
+        loop .row
+        pop  si
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  8
+
+; ----------------------------------------------------------------------------
+; DrawBigText(x, y, address, colour)   pushed in that order
+; Purpose : text made of big characters, 12 pixels per character
+; Inputs  : [bp+10]=x  [bp+8]=y  [bp+6]=address of the 0-ended text  [bp+4]=colour
+; Outputs : none        Changes : none (AX, DX, SI preserved)
+; ----------------------------------------------------------------------------
+DrawBigText:
+        push bp
+        mov  bp, sp
+        push ax
+        push dx
+        push si
+        mov  si, [bp+6]
+        mov  dx, [bp+10]
+.next:
+        mov  al, [si]
+        test al, al
+        jz   .done
+        xor  ah, ah
+        push dx
+        push word [bp+8]
+        push ax
+        push word [bp+4]
+        call DrawCharBig
+        add  dx, BIG_ADV
+        inc  si
+        jmp  .next
+.done:
+        pop  si
+        pop  dx
+        pop  ax
+        pop  bp
+        ret  8
+
+; ----------------------------------------------------------------------------
+; DrawCentered(y, address, colour, big)   pushed in that order
+; Purpose : draw a 0-ended text in the middle of the screen (big = 1 for the
+;           large font). Width = characters * advance - gap.
+; Inputs  : [bp+10]=y  [bp+8]=address  [bp+6]=colour  [bp+4]=big
+; Outputs : none        Changes : none (AX, BX, CX, DX preserved)
+; ----------------------------------------------------------------------------
+DrawCentered:
+        push bp
+        mov  bp, sp
+        push ax
+        push bx
+        push cx
+        push dx
+        mov  bx, [bp+8]
+        xor  cx, cx                     ; CX = number of characters
+.count:
+        cmp  byte [bx], 0
+        je   .counted
+        inc  cx
+        inc  bx
+        jmp  .count
+.counted:
+        mov  ax, CHAR_ADV
+        mov  bx, 1                      ; gap after the last character
+        cmp  word [bp+4], 0
+        je   .adv_ok
+        mov  ax, BIG_ADV
+        mov  bx, 2
+.adv_ok:
+        mul  cx                         ; AX = characters * advance (DX changes)
+        sub  ax, bx                     ; minus the gap = width of the text
+        mov  bx, SCREEN_W
+        sub  bx, ax
+        shr  bx, 1                      ; x = (320 - width) / 2
+        push bx
+        push word [bp+10]
+        push word [bp+8]
+        push word [bp+6]
+        cmp  word [bp+4], 0
+        je   .small
+        call DrawBigText
+        jmp  .done
+.small:
+        call DrawText
+.done:
+        pop  dx
+        pop  cx
+        pop  bx
+        pop  ax
+        pop  bp
+        ret  8
+
+; ----------------------------------------------------------------------------
+; DrawBox(x, y, w, h, border, fill)    pushed in that order
+; Purpose : a filled rectangle with a 2 pixel border
+; Inputs  : [bp+14]=x [bp+12]=y [bp+10]=w [bp+8]=h [bp+6]=border [bp+4]=fill
+; Outputs : none        Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawBox:
+        push bp
+        mov  bp, sp
+        push ax
+        push word [bp+14]
+        push word [bp+12]
+        push word [bp+10]
+        push word [bp+8]
+        push word [bp+6]
+        call FillRect                   ; the border colour, whole box
+        mov  ax, [bp+14]
+        add  ax, 2
+        push ax
+        mov  ax, [bp+12]
+        add  ax, 2
+        push ax
+        mov  ax, [bp+10]
+        sub  ax, 4
+        push ax
+        mov  ax, [bp+8]
+        sub  ax, 4
+        push ax
+        push word [bp+4]
+        call FillRect                   ; the inside
+        pop  ax
+        pop  bp
+        ret  12
+
+; ----------------------------------------------------------------------------
+; DrawBackdrop(colour)
+; Purpose : fill the whole screen (320 x 200) with one colour
+; Inputs  : [bp+4]=colour        Outputs : none        Changes : none
+; ----------------------------------------------------------------------------
+DrawBackdrop:
+        push bp
+        mov  bp, sp
+        push word 0
+        push word 0
+        push word SCREEN_W
+        push word SCREEN_H
+        push word [bp+4]
+        call FillRect
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; Pressed(scan)
+; Purpose : was this key pressed THIS frame (down now, up in the previous
+;           frame)? Holding a key does not repeat. Needs prev_keys, which
+;           SavePrevKeys refreshes once per frame.
+; Inputs  : [bp+4]=scan code        Outputs : AX = 1 just pressed, else 0
+; Changes : AX only
+; ----------------------------------------------------------------------------
+Pressed:
+        push bp
+        mov  bp, sp
+        push bx
+        mov  bx, [bp+4]
+        xor  ax, ax
+        cmp  byte [key_table + bx], 0
+        je   .out                       ; not down
+        cmp  byte [prev_keys + bx], 0
+        jne  .out                       ; was already down
+        mov  ax, 1
+.out:
+        pop  bx
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; SavePrevKeys
+; Purpose : remember the key table of this frame (128 bytes, one block move)
+; Inputs  : none        Outputs : prev_keys        Changes : none
+; ----------------------------------------------------------------------------
+SavePrevKeys:
+        push cx
+        push si
+        push di
+        push es
+        push cs
+        pop  es                         ; ES = our segment (not the buffer!)
+        cld
+        mov  si, key_table
+        mov  di, prev_keys
+        mov  cx, 128
+        rep  movsb
+        pop  es
+        pop  di
+        pop  si
+        pop  cx
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawGameScene
+; Purpose : the picture of the level: tiles, enemies, mushrooms, pop-ups,
+;           Mario (unless hidden), the HUD, and the test overlay (key D)
+; Inputs  : none        Outputs : none        Changes : none
+; ----------------------------------------------------------------------------
+DrawGameScene:
+        call ClearBuffer
+        call DrawMap
+        call DrawEnemies
+        call DrawMushrooms
+        call DrawPops
+        cmp  byte [mario_hidden], 0
+        jne  .no_mario
+        call DrawMario
+.no_mario:
+        call DrawHUD
+        cmp  byte [debug_on], 0
+        je   .out
+        call DrawMinimap
+        call DrawPhysicsBars
+        call DrawStatusBars
+.out:
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawTitleScreen
+; Purpose : game name, START GAME / EXIT (highlighted), controls, team details
+; Inputs  : menu_sel        Outputs : none        Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawTitleScreen:
+        push ax
+        push word COL_SKY
+        call DrawBackdrop
+        push word 0                     ; the ground
+        push word 160
+        push word SCREEN_W
+        push word 40
+        push word COL_GROUND
+        call FillRect
+        push word 0
+        push word 160
+        push word SCREEN_W
+        push word 4
+        push word COL_GROUND_TOP
+        call FillRect
+        push word 40                    ; Mario, a Goomba and a coin
+        push word 144
+        push word spr_small_stand
+        push word 0
+        call DrawSprite
+        push word 250
+        push word 144
+        push word spr_goomba
+        push word 0
+        call DrawSprite
+        push word 56
+        push word 118
+        push word spr_coin
+        push word 0
+        call DrawSprite
+        push word 40                    ; the title box
+        push word 14
+        push word 240
+        push word 66
+        push word COL_OUTLINE
+        push word COL_HUD
+        call DrawBox
+        push word 24
+        push word str_title1
+        push word COL_COIN
+        push word 1
+        call DrawCentered
+        push word 46
+        push word str_title2
+        push word COL_TEXT
+        push word 1
+        call DrawCentered
+        mov  ax, 100                    ; y of the bar behind START GAME
+        cmp  byte [menu_sel], 0
+        je   .bar_y
+        mov  ax, 118                    ; y of the bar behind EXIT
+.bar_y:
+        push word 100                   ; the highlight bar behind the chosen option
+        push ax
+        push word 120
+        push word 13
+        push word COL_BRICK
+        call FillRect
+        push dx
+        mov  ax, COL_TEXT               ; colour of the chosen option ...
+        mov  dx, COL_OUTLINE            ; ... and of the other one (easy to read)
+        cmp  byte [menu_sel], 0
+        je   .colours_ok
+        xchg ax, dx                     ; EXIT is chosen: swap the two colours
+.colours_ok:
+        push word 104
+        push word str_start
+        push ax
+        push word 0
+        call DrawCentered
+        push word 122
+        push word str_exit
+        push dx
+        push word 0
+        call DrawCentered
+        pop  dx
+        push word 142
+        push word str_hint
+        push word COL_OUTLINE
+        push word 0
+        call DrawCentered
+        push word 170
+        push word str_team1
+        push word COL_TEXT
+        push word 0
+        call DrawCentered
+        push word 182
+        push word str_team2
+        push word COL_TEXT
+        push word 0
+        call DrawCentered
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawPausedBanner
+; Purpose : the word PAUSED on top of the frozen picture (the buffer is NOT
+;           cleared in the PAUSED state, so the game picture stays visible)
+; Inputs  : none        Outputs : none        Changes : none
+; ----------------------------------------------------------------------------
+DrawPausedBanner:
+        push word 88
+        push word 76
+        push word 144
+        push word 50
+        push word COL_OUTLINE
+        push word COL_HUD
+        call DrawBox
+        push word 88
+        push word str_paused
+        push word COL_TEXT
+        push word 1
+        call DrawCentered
+        push word 110
+        push word str_pause_help
+        push word COL_COIN
+        push word 0
+        call DrawCentered
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawLifeLostScreen
+; Purpose : world name, a Mario icon and the lives left
+; Inputs  : lives        Outputs : none        Changes : none
+; ----------------------------------------------------------------------------
+DrawLifeLostScreen:
+        push word COL_HUD
+        call DrawBackdrop
+        push word 60
+        push word 36
+        push word 200
+        push word 128
+        push word COL_COIN
+        push word COL_OUTLINE
+        call DrawBox
+        push word 54
+        push word str_lifeworld
+        push word COL_COIN
+        push word 1
+        call DrawCentered
+        push word 128                   ; the Mario icon
+        push word 90
+        push word spr_small_stand
+        push word 0
+        call DrawSprite
+        push word 152
+        push word 98
+        push word 'X'
+        push word COL_TEXT
+        call DrawChar
+        xor  ax, ax
+        mov  al, [lives]
+        push word 160
+        push word 98
+        push word 0
+        push ax
+        push word 2
+        push word COL_TEXT
+        call DrawNumber
+        push word 130
+        push word str_lives_left
+        push word COL_TEXT
+        push word 0
+        call DrawCentered
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawCompleteScreen
+; Purpose : LEVEL COMPLETE with score, coins, time left and the time bonus
+;           (time left x 50), as in Figure 10 of the manual
+; Inputs  : score, coins, time_left, win_bonus        Outputs : none
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+DrawCompleteScreen:
+        push ax
+        push word COL_HUD
+        call DrawBackdrop
+        push word 30
+        push word 20
+        push word 260
+        push word 160
+        push word COL_COIN
+        push word COL_OUTLINE
+        call DrawBox
+        push word 36
+        push word str_complete
+        push word COL_COIN
+        push word 1
+        call DrawCentered
+        push word 64                    ; SCORE
+        push word 76
+        push word str_score
+        push word COL_COIN
+        call DrawText
+        push word 170
+        push word 76
+        push word [score_hi]
+        push word [score_lo]
+        push word 6
+        push word COL_TEXT
+        call DrawNumber
+        push word 64                    ; COINS
+        push word 92
+        push word str_coins
+        push word COL_COIN
+        call DrawText
+        xor  ax, ax
+        mov  al, [coins]
+        push word 170
+        push word 92
+        push word 0
+        push ax
+        push word 2
+        push word COL_TEXT
+        call DrawNumber
+        push word 64                    ; TIME LEFT
+        push word 108
+        push word str_timeleft
+        push word COL_COIN
+        call DrawText
+        push word 170
+        push word 108
+        push word 0
+        push word [time_left]
+        push word 3
+        push word COL_TEXT
+        call DrawNumber
+        push word 64                    ; TIME x 50 = BONUS
+        push word 124
+        push word 0
+        push word [time_left]
+        push word 3
+        push word COL_TEXT
+        call DrawNumber
+        push word 88
+        push word 124
+        push word str_times50
+        push word COL_COIN
+        call DrawText
+        push word 134
+        push word 124
+        push word 0
+        push word [win_bonus]
+        push word 5
+        push word COL_TEXT
+        call DrawNumber
+        push word 152
+        push word str_press_enter
+        push word COL_TEXT
+        push word 0
+        call DrawCentered
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; DrawGameOverScreen
+; Purpose : GAME OVER with the final score and the key that returns to the title
+; Inputs  : score        Outputs : none        Changes : none
+; ----------------------------------------------------------------------------
+DrawGameOverScreen:
+        push word COL_HUD
+        call DrawBackdrop
+        push word 50
+        push word 40
+        push word 220
+        push word 120
+        push word COL_HERO
+        push word COL_OUTLINE
+        call DrawBox
+        push word 56
+        push word str_gameover
+        push word COL_COIN
+        push word 1
+        call DrawCentered
+        push word 92
+        push word str_final
+        push word COL_COIN
+        push word 0
+        call DrawCentered
+        push word 142
+        push word 106
+        push word [score_hi]
+        push word [score_lo]
+        push word 6
+        push word COL_TEXT
+        call DrawNumber
+        push word 134
+        push word str_press_enter
+        push word COL_TEXT
+        push word 0
+        call DrawCentered
+        ret
+
+; ----------------------------------------------------------------------------
+; StartDying(vy)
+; Purpose : Mario dies (Section 5.8 step 1): enemies, clock and controls
+;           freeze, state DYING. vy = the starting vertical speed of the death
+;           animation (an upward hop, or 0 for a fall into a pit).
+; Inputs  : [bp+4]=vy        Outputs : game_state, dying_timer, hero data
+; Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+StartDying:
+        push bp
+        mov  bp, sp
+        push ax
+        cmp  word [game_state], STATE_PLAYING
+        jne  .out                       ; already dying (or not playing)
+        mov  word [game_state], STATE_DYING
+        mov  word [dying_timer], 0
+        mov  ax, [bp+4]
+        mov  [mario_vy], ax
+        mov  word [mario_vx], 0
+        mov  byte [on_ground], 0        ; jumping pose
+        mov  word [invuln_timer], 0     ; no blinking while dying
+.out:
+        pop  ax
+        pop  bp
+        ret  2
+
+; ----------------------------------------------------------------------------
+; FinishDeath
+; Purpose : the death animation is over (Section 5.8 steps 3 to 5):
+;           lives - 1; lives left -> LIFE LOST screen; none left -> GAME OVER
+; Inputs  : none        Outputs : lives, game_state, screen_timer
+; Changes : none
+; ----------------------------------------------------------------------------
+FinishDeath:
+        cmp  byte [lives], 0
+        je   .no_lives_left             ; (cannot happen, but never go below 0)
+        dec  byte [lives]
+.no_lives_left:
+        mov  word [screen_timer], 0
+        cmp  byte [lives], 0
+        je   .game_over
+        mov  word [game_state], STATE_LIFE_LOST
+        jmp  .out
+.game_over:
+        mov  word [game_state], STATE_GAME_OVER
+.out:
+        ret
+
+; ----------------------------------------------------------------------------
+; StartWin
+; Purpose : the flag pole was touched (Section 5.11 step 1 and 2):
+;           flag points by the row of Mario's feet (2-3: 5000, 4: 2000,
+;           5: 800, 6-7: 400, 8: 100), snap Mario to the pole, state WIN
+;           (clock and controls are frozen)
+; Inputs  : flag_row        Outputs : score, game_state, hero data
+; Changes : none (AX, BX preserved)
+; ----------------------------------------------------------------------------
+StartWin:
+        push ax
+        push bx
+        cmp  word [game_state], STATE_PLAYING
+        jne  .out
+        xor  ax, ax
+        mov  al, [flag_row]
+        cmp  al, 2
+        jae  .not_too_high
+        mov  al, 2
+.not_too_high:
+        cmp  al, 8
+        jbe  .not_too_low
+        mov  al, 8
+.not_too_low:
+        sub  al, 2                      ; row 2..8 -> table index 0..6
+        xor  ah, ah
+        shl  ax, 1
+        mov  bx, ax
+        push word [flag_points + bx]
+        call AddScore                   ; the higher he touched, the more points
+        mov  word [mario_x], POLE_X     ; snap to the pole
+        mov  byte [mario_xf], 0
+        mov  byte [mario_yf], 0
+        mov  word [mario_vx], 0
+        mov  word [mario_vy], 0
+        mov  byte [on_ground], 1        ; standing pose while he slides
+        mov  byte [win_phase], 0
+        mov  byte [mario_hidden], 0
+        mov  word [win_timer], 0
+        mov  word [game_state], STATE_WIN
+.out:
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StartComplete
+; Purpose : the win sequence is over (Section 5.11 step 4): time left x 50
+;           is added to the score, state LEVEL COMPLETE
+; Inputs  : time_left        Outputs : win_bonus, score, game_state
+; Changes : none (AX, CX, DX preserved)
+; ----------------------------------------------------------------------------
+StartComplete:
+        push ax
+        push cx
+        push dx
+        mov  ax, [time_left]
+        mov  cx, 50
+        mul  cx                         ; AX = seconds * 50 (at most 15000)
+        mov  [win_bonus], ax
+        push ax
+        call AddScore
+        mov  word [game_state], STATE_COMPLETE
+        pop  dx
+        pop  cx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StateTitle   (one frame of the TITLE state)
+; Purpose : Up/Down move the highlight; Enter on START starts a new game, on
+;           EXIT leaves; Esc leaves
+; Inputs  : keys        Outputs : menu_sel, game_state        Changes : none
+; ----------------------------------------------------------------------------
+StateTitle:
+        push ax
+        push word SC_UP
+        call Pressed
+        test ax, ax
+        jz   .not_up
+        mov  byte [menu_sel], 0         ; START GAME
+.not_up:
+        push word SC_DOWN
+        call Pressed
+        test ax, ax
+        jz   .not_down
+        mov  byte [menu_sel], 1         ; EXIT
+.not_down:
+        push word SC_ESC
+        call Pressed
+        test ax, ax
+        jnz  .leave
+        push word SC_ENTER
+        call Pressed
+        test ax, ax
+        jz   .draw
+        cmp  byte [menu_sel], 0
+        jne  .leave                     ; Enter on EXIT
+        call NewGame                    ; Enter on START: score 0, 3 lives ...
+        mov  word [game_state], STATE_PLAYING
+        jmp  .out
+.leave:
+        mov  word [game_state], STATE_EXIT
+        jmp  .out
+.draw:
+        call DrawTitleScreen
+.out:
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StatePlaying   (one frame of the PLAYING state, Section 5.13)
+; Purpose : Esc -> TITLE, P -> PAUSED, otherwise the normal frame:
+;           clock, Mario, enemies, mushrooms, hazards, contacts, items, camera,
+;           then the picture. A death starts DYING, the flag pole starts WIN.
+; Inputs  : none        Outputs : many        Changes : none (AX preserved)
+; ----------------------------------------------------------------------------
+StatePlaying:
+        push ax
+        push word SC_ESC
+        call Pressed
+        test ax, ax
+        jz   .not_esc
+        mov  word [game_state], STATE_TITLE
+        jmp  .out
+.not_esc:
+        push word SC_P
+        call Pressed
+        test ax, ax
+        jz   .play
+        mov  word [game_state], STATE_PAUSED
+        jmp  .out
+.play:
+        call UpdateClock                ; 6. real seconds
+        call HandleDebugKeys
+        call UpdateMario                ; 2-3. keys, physics, tile collision
+        call UpdateEnemies              ; 4. enemies and shells
+        call UpdateMushrooms
+        call UpdatePops
+        call CheckHazards               ; 7. clock 0, pit, flag pole touch
+        call CheckEnemies               ; 5. stomp, kick, hurt
+        call CollectItems               ; 5. coin tiles, mushrooms
+        call UpdateCamera               ; 8. camera
+        cmp  word [game_state], STATE_PLAYING
+        jne  .draw                      ; he died in this frame
+        cmp  byte [flag_touched], 0
+        je   .draw
+        call StartWin                   ; the flag pole was touched
+.draw:
+        call DrawGameScene              ; 9. the picture
+.out:
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StatePaused   (one frame of the PAUSED state)
+; Purpose : everything is frozen: the buffer is not cleared, only the PAUSED
+;           banner is drawn over it. P resumes, Esc returns to the title.
+; Inputs  : keys        Outputs : game_state        Changes : none
+; ----------------------------------------------------------------------------
+StatePaused:
+        push ax
+        push word SC_P
+        call Pressed
+        test ax, ax
+        jz   .not_p
+        mov  word [game_state], STATE_PLAYING
+        jmp  .out
+.not_p:
+        push word SC_ESC
+        call Pressed
+        test ax, ax
+        jz   .banner
+        mov  word [game_state], STATE_TITLE
+        jmp  .out
+.banner:
+        call DrawPausedBanner
+.out:
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StateDying   (one frame of the DYING state, Section 5.8 step 2)
+; Purpose : the death animation: Mario in the jumping pose moves up (the hop),
+;           then falls off the bottom of the screen with gravity and NO
+;           collisions. About 1.5 seconds (DEATH_FRAMES), then FinishDeath.
+; Inputs  : none        Outputs : mario_y, mario_vy        Changes : none
+; ----------------------------------------------------------------------------
+StateDying:
+        push ax
+        push dx
+        mov  ax, [mario_vy]
+        add  ax, GRAVITY                ; falls faster and faster (no limit, no tiles)
+        mov  [mario_vy], ax
+        mov  dl, al
+        sar  ax, 8
+        add  [mario_yf], dl
+        adc  [mario_y], ax              ; no tile test at all
+        inc  word [dying_timer]
+        call DrawGameScene
+        cmp  word [dying_timer], DEATH_FRAMES
+        jb   .out
+        call FinishDeath
+.out:
+        pop  dx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StateLifeLost   (one frame of the LIFE LOST state)
+; Purpose : show the Life-lost screen for about 2 seconds, then restart the
+;           level (map, enemies, mushrooms, clock, camera, Mario) and play.
+; Inputs  : none        Outputs : game_state        Changes : none
+; ----------------------------------------------------------------------------
+StateLifeLost:
+        call DrawLifeLostScreen
+        inc  word [screen_timer]
+        cmp  word [screen_timer], LIFE_LOST_FRAMES
+        jb   .out
+        call ResetLevel                 ; score and coins are kept
+        mov  word [game_state], STATE_PLAYING
+.out:
+        ret
+
+; ----------------------------------------------------------------------------
+; StateWin   (one frame of the WIN SEQUENCE, Section 5.11 steps 2 and 3)
+; Purpose : phase 0: Mario slides down the pole (3 pixels per frame) to its
+;           base. Phase 1: he disappears (as the manual allows) for about 1
+;           second. Then StartComplete.
+; Inputs  : none        Outputs : mario_y, win_phase, win_timer
+; Changes : none (AX, BX, DX preserved)
+; ----------------------------------------------------------------------------
+StateWin:
+        push ax
+        push bx
+        push dx
+        cmp  byte [win_phase], 0
+        jne  .phase1
+        call HeroHeight                 ; AX = body height
+        mov  dx, BASE_TOP_Y
+        sub  dx, ax                     ; y of his top when his feet touch the base
+        mov  bx, [mario_y]
+        add  bx, WIN_SLIDE_SPEED        ; slide down
+        cmp  bx, dx
+        jl   .still_sliding
+        mov  bx, dx                     ; he reached the base of the pole
+        mov  byte [win_phase], 1
+        mov  word [win_timer], 0
+.still_sliding:
+        mov  [mario_y], bx
+        call DrawGameScene
+        jmp  .out
+.phase1:
+        mov  byte [mario_hidden], 1     ; he walks into the castle (disappears)
+        inc  word [win_timer]
+        call DrawGameScene
+        cmp  word [win_timer], WIN_HIDE_FRAMES
+        jb   .out
+        call StartComplete
+.out:
+        pop  dx
+        pop  bx
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StateComplete / StateGameOver   (one frame each)
+; Purpose : draw the screen; Enter returns to the title
+; Inputs  : keys        Outputs : game_state        Changes : none
+; ----------------------------------------------------------------------------
+StateComplete:
+        push ax
+        call DrawCompleteScreen
+        push word SC_ENTER
+        call Pressed
+        test ax, ax
+        jz   .out
+        mov  word [game_state], STATE_TITLE
+.out:
+        pop  ax
+        ret
+
+StateGameOver:
+        push ax
+        call DrawGameOverScreen
+        push word SC_ENTER
+        call Pressed
+        test ax, ax
+        jz   .out
+        mov  word [game_state], STATE_TITLE
+.out:
+        pop  ax
+        ret
+
+; ----------------------------------------------------------------------------
+; StateExit   (the EXIT state)
+; Purpose : leave the game through the one exit routine (never returns)
+; ----------------------------------------------------------------------------
+StateExit:
+        jmp  Shutdown
